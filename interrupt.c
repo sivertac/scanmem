@@ -28,7 +28,7 @@
 #include "interrupt.h"
 
 sigjmp_buf jmpbuf;       /* used when aborting a command due to an interrupt */
-sighandler_t oldsig;     /* reinstalled before longjmp */
+struct sigaction oldsig;     /* reinstalled before longjmp */
 unsigned intr_used;
 
 /* signal handler used to handle an interrupt during commands */
@@ -44,3 +44,12 @@ void interrupt_scan(int n)
     (void) n;
     sm_set_stop_flag(true);
 }
+
+void set_interrupted_signal() {
+    struct sigaction interrupt_action = {};                         
+    interrupt_action.sa_handler = interrupted;                      
+    if (sigaction(SIGINT, &interrupt_action, &oldsig) == -1) {      
+        exit(EXIT_FAILURE);                                         
+    }                                                               
+    intr_used = 1;
+}                          

@@ -1700,6 +1700,9 @@ bool handler__option(globals_t * vars, char **argv, unsigned argc)
         return false;
 #endif
     }
+    else if (strcasecmp(argv[1], "num_parallel_jobs") == 0) {
+
+    }
     else
     {
         show_error("unknown option specified, see `help option`.\n");

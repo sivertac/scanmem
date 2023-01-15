@@ -28,7 +28,7 @@
 #include <signal.h>
 
 extern sigjmp_buf jmpbuf;       /* used when aborting a command due to an interrupt */
-extern sighandler_t oldsig;     /* reinstalled before longjmp */
+extern struct sigaction oldsig;        /* reinstalled before longjmp */
 extern unsigned intr_used;
 
 /* signal handler used to handle an interrupt during commands */
@@ -37,8 +37,31 @@ void interrupted(int);
 /* signal handler used to handle an interrupt during scans */
 void interrupt_scan(int);
 
-#define INTERRUPTABLE() ((oldsig = signal(SIGINT, interrupted)), intr_used = 1, sigsetjmp(jmpbuf, 1))
-#define INTERRUPTABLESCAN() ((oldsig = signal(SIGINT, interrupt_scan)), intr_used = 1)
-#define ENDINTERRUPTABLE() (intr_used ? ((void) signal(SIGINT, oldsig), intr_used = 0) : (intr_used = 0))
+void set_interrupted_signal();
+
+#define INTERRUPTABLE() (set_interrupted_signal(), sigsetjmp(jmpbuf, 1))
+
+
+#define INTERRUPTABLESCAN()                                         \
+do {                                                                \
+    struct sigaction interrupt_action = {};                         \
+    interrupt_action.sa_handler = interrupt_scan;                   \
+    if (sigaction(SIGINT, &interrupt_action, &oldsig) == -1) {      \
+        exit(EXIT_FAILURE);                                         \
+    }                                                               \
+    intr_used = 1;                                                  \
+} while (0)
+    
+    
+#define ENDINTERRUPTABLE()                                          \
+do {                                                                \
+    if (intr_used) {                                                \
+        if (sigaction(SIGINT, &oldsig, NULL) == -1) {               \
+            exit(EXIT_FAILURE);                                     \
+        }                                                           \
+    }                                                               \
+    intr_used = 0;                                                  \
+} while (0)
+
 
 #endif /* INTERRUPT_H */

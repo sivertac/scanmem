@@ -61,6 +61,9 @@ typedef struct {
         unsigned short dump_with_ascii;
         unsigned short reverse_endianness;
         unsigned short no_ptrace;
+
+        /* multi threaded */
+        int num_parallel_jobs; /* */
     } options;
 } globals_t;
 
