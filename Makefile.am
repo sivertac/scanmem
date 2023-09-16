@@ -31,6 +31,7 @@ libscanmem_la_include_HEADERS = commands.h \
 
 libscanmem_la_SOURCES = commands.c \
     ptrace.c \
+    ptracemulti.c \
     handlers.h \
     handlers.c \
     interrupt.h \
