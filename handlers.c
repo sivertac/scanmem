@@ -760,7 +760,12 @@ bool handler__operators(globals_t * vars, char **argv, unsigned argc)
             show_error("there are currently no matches.\n");
             return false;
         }
+#if SCANMEM_MULTI_THREADING == 1
+        show_info("multi-threaded enabled\n");
+        if (sm_multi_checkmatches(vars, m, &val) == false) {
+#else
         if (sm_checkmatches(vars, m, &val) == false) {
+#endif
             show_error("failed to search target address space.\n");
             return false;
         }
@@ -782,7 +787,12 @@ bool handler__operators(globals_t * vars, char **argv, unsigned argc)
         }
         else
         {
+#if SCANMEM_MULTI_THREADING == 1
+            show_info("multi-threaded enabled\n");
+            if (sm_multi_searchregions(vars, m, &val) != true) {
+#else
             if (sm_searchregions(vars, m, &val) != true) {
+#endif
                 show_error("failed to search target address space.\n");
                 return false;
             }

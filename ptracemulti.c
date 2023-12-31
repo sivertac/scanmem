@@ -101,7 +101,7 @@ struct attach_state_t {
     pid_t pid;                  /* pid of scanned process */
 };
 
-bool sm_multi_attach(pid_t target, struct attach_state_t* attach_state) {
+static bool sm_multi_attach(pid_t target, struct attach_state_t* attach_state) {
     if (!sm_globals.options.no_ptrace)
     {
         int status;
@@ -143,13 +143,11 @@ bool sm_multi_attach(pid_t target, struct attach_state_t* attach_state) {
 
 }
 
-#if 0
-
-bool sm_detach(pid_t target)
+static bool sm_multi_detach(pid_t target, struct attach_state_t* attach_state)
 {
 #if HAVE_PROCMEM
     /* close the mem file before detaching */
-    close(peekbuf.procmem_fd);
+    close(attach_state->procmem_fd);
 #endif
 
     if (!sm_globals.options.no_ptrace)
@@ -168,13 +166,13 @@ bool sm_detach(pid_t target)
  * using either `ptrace` or `pread` on `/proc/pid/mem`.
  * The target process is not passed, but read from the static peekbuf.
  * `sm_attach()` MUST be called before this function. */
-static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address, size_t size)
+static inline size_t sm_multi_readmemory(uint8_t *dest_buffer, const char *target_address, size_t size, struct attach_state_t* attach_state)
 {
     size_t nread = 0;
 
 #if HAVE_PROCMEM
     do {
-        ssize_t ret = pread(peekbuf.procmem_fd, dest_buffer + nread,
+        ssize_t ret = pread(attach_state->procmem_fd, dest_buffer + nread,
                             size - nread, (unsigned long)(target_address + nread));
         if (ret == -1) {
             /* we can't read further, report what was read */
@@ -192,7 +190,7 @@ static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address
     errno = 0;
     for (nread = 0; nread < size; nread += sizeof(long)) {
         const char *ptrace_address = target_address + nread;
-        long ptraced_long = ptrace(PTRACE_PEEKDATA, peekbuf.pid, ptrace_address, NULL);
+        long ptraced_long = ptrace(PTRACE_PEEKDATA, attach_state->pid, ptrace_address, NULL);
 
         /* check if ptrace() succeeded */
         if (UNLIKELY(ptraced_long == -1L && errno != 0)) {
@@ -202,7 +200,7 @@ static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address
                 /* read backwards until we get a good read, then shift out the right value */
                 for (j = 1, errno = 0; j < sizeof(long); j++, errno = 0) {
                     /* try for a shifted ptrace - 'continue' (i.e. try an increased shift) if it fails */
-                    ptraced_long = ptrace(PTRACE_PEEKDATA, peekbuf.pid, ptrace_address - j, NULL);
+                    ptraced_long = ptrace(PTRACE_PEEKDATA, attach_state->pid, ptrace_address - j, NULL);
                     if ((ptraced_long == -1L) && (errno == EIO || errno == EFAULT))
                         continue;
 
@@ -233,7 +231,7 @@ static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address
  * `sm_attach()` MUST be called before this function.
  */
 
-extern inline bool sm_peekdata(const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength)
+static inline bool sm_multi_peekdata(const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength, struct attach_state_t* attach_state)
 {
     const char *reqaddr = addr;
     unsigned int i;
@@ -287,7 +285,7 @@ extern inline bool sm_peekdata(const void *addr, uint16_t length, const mem64_t 
     for (i = 0; i < missing_bytes; i += PEEKDATA_CHUNK)
     {
         const char *target_address = peekbuf.base + peekbuf.size;
-        size_t len = readmemory(&peekbuf.cache[peekbuf.size], target_address, PEEKDATA_CHUNK);
+        size_t len = sm_multi_readmemory(&peekbuf.cache[peekbuf.size], target_address, PEEKDATA_CHUNK, attach_state);
 
         /* check if the read succeeded */
         if (UNLIKELY(len < PEEKDATA_CHUNK)) {
@@ -338,10 +336,12 @@ static inline uint16_t flags_to_memlength(scan_data_type_t scan_data_type, match
 
 /* This is the function that handles when you enter a value (or >, <, =) for the second or later time (i.e. when there's already a list of matches);
  * it reduces the list to those that still match. It returns false on failure to attach, detach, or reallocate memory, otherwise true. */
-bool sm_checkmatches(globals_t *vars,
+bool sm_multi_checkmatches(globals_t *vars,
                      scan_match_type_t match_type,
                      const uservalue_t *uservalue)
 {
+    struct attach_state_t attach_state;
+
     matches_and_old_values_swath *reading_swath_index = vars->matches->swaths;
     matches_and_old_values_swath reading_swath = *reading_swath_index;
 
@@ -382,7 +382,7 @@ bool sm_checkmatches(globals_t *vars,
     vars->stop_flag = false;
 
     /* stop and attach to the target */
-    if (sm_attach(vars->target) == false)
+    if (sm_multi_attach(vars->target, &attach_state) == false)
         return false;
 
     INTERRUPTABLESCAN();
@@ -398,7 +398,7 @@ bool sm_checkmatches(globals_t *vars,
         void *address = reading_swath.first_byte_in_child + reading_iterator;
 
         /* read value from this address */
-        if (UNLIKELY(sm_peekdata(address, old_length, &memory_ptr, &memlength) == false))
+        if (UNLIKELY(sm_multi_peekdata(address, old_length, &memory_ptr, &memlength, &attach_state) == false))
         {
             /* If we can't look at the data here, just abort the whole recording, something bad happened */
             required_extra_bytes_to_record = 0;
@@ -485,13 +485,14 @@ bool sm_checkmatches(globals_t *vars,
     show_info("we currently have %ld matches.\n", vars->num_matches);
 
     /* okay, detach */
-    return sm_detach(vars->target);
+    return sm_multi_detach(vars->target, &attach_state);
 }
 
-
 /* sm_searchregions() performs an initial search of the process for values matching `uservalue` */
-bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue)
+bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue)
 {
+    struct attach_state_t attach_state;
+
     matches_and_old_values_swath *writing_swath_index;
     int required_extra_bytes_to_record = 0;
     unsigned long total_size = 0;
@@ -510,7 +511,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     assert(sm_scan_routine);
 
     /* stop and attach to the target */
-    if (sm_attach(vars->target) == false)
+    if (sm_multi_attach(vars->target, &attach_state) == false)
         return false;
 
    
@@ -610,7 +611,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
 
                 /* load the next buffer block */
                 size_t read_size = MIN(memlength, MAX_ALLOC_SIZE);
-                size_t nread = readmemory(data, reg_pos, read_size);
+                size_t nread = sm_multi_readmemory(data, reg_pos, read_size, &attach_state);
                 if (nread < read_size) {
                     /* the region ends here, update `memlength` */
                     memlength = nread;
@@ -681,8 +682,10 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     show_info("we currently have %ld matches.\n", vars->num_matches);
 
     /* okay, detach */
-    return sm_detach(vars->target);
+    return sm_multi_detach(vars->target, &attach_state);
 }
+
+#if 0
 
 /* Needs to support only ANYNUMBER types */
 bool sm_setaddr(pid_t target, void *addr, const value_t *to)

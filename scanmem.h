@@ -92,4 +92,10 @@ bool sm_attach(pid_t target);
 bool sm_read_array(pid_t target, const void *addr, void *buf, size_t len);
 bool sm_write_array(pid_t target, void *addr, const void *data, size_t len);
 
+/* ptracemulti.c */
+bool sm_multi_checkmatches(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
+bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
+
+#define SCANMEM_MULTI_THREADING 1
+
 #endif /* SCANMEM_H */
