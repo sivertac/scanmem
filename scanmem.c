@@ -68,7 +68,7 @@ globals_t sm_globals = {
         1,                      /* dump_with_ascii */
         0,                      /* reverse_endianness */
         0,                      /* no_ptrace */
-        1,                      /* num_parallel_jobs */
+        0,                      /* num_parallel_jobs */
     }
 };
 

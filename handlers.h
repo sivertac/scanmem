@@ -382,7 +382,7 @@ bool handler__write(globals_t *vars, char **argv, unsigned argc);
                  "\t1:\tno ptrace\n" \
                  "\n" \
                  "num_parallel_jobs\t set number of parallel jobs when performing a scan\n" \
-                 "\t\t\t Default:1\n" \
+                 "\t\t\t Default:0\n" \
                  "\tpossible values:\n"\
                  "\t0:\tauto detect number of physical threads on system and use all\n" \
                  "\t1:\tregular single threaded scan\n" \

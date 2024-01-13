@@ -1710,9 +1710,18 @@ bool handler__option(globals_t * vars, char **argv, unsigned argc)
         return false;
 #endif
     }
+#if SCANMEM_MULTI_THREADING == 1
     else if (strcasecmp(argv[1], "num_parallel_jobs") == 0) {
+        int num_parallel_jobs = atoi(argv[2]);
+        
+        if (num_parallel_jobs < 0) {
+            show_error("bad value for num_parallel_jobs, see `help option`.\n");
+            return false;
+        }
 
+        vars->options.num_parallel_jobs = num_parallel_jobs;
     }
+#endif
     else
     {
         show_error("unknown option specified, see `help option`.\n");

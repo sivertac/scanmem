@@ -46,6 +46,9 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <sys/sysinfo.h>
+#include <sys/syscall.h>
+#include <pthread.h>
 
 // dirty hack for FreeBSD
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
@@ -488,74 +491,44 @@ bool sm_multi_checkmatches(globals_t *vars,
     return sm_multi_detach(vars->target, &attach_state);
 }
 
-/* sm_searchregions() performs an initial search of the process for values matching `uservalue` */
-bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue)
-{
-    struct attach_state_t attach_state;
+#if 0
+struct sm_multi_searchregions_thread_args {
+    element_t const *begin;
+    element_t const *end; /* end is not inclusive */
 
-    matches_and_old_values_swath *writing_swath_index;
-    int required_extra_bytes_to_record = 0;
-    unsigned long total_size = 0;
+    /**/
+    struct attach_state_t *attach_state;
+    const uservalue_t *uservalue;
+
+    matches_and_old_values_array **matches;
+    pthread_mutex_t *matches_mutex;
+    matches_and_old_values_swath **writing_swath_index;
+    unsigned long *num_matches;
+    int *required_extra_bytes_to_record;
+};
+
+static void sm_multi_searchregions_thread_func(void* args) {
+    struct sm_multi_searchregions_thread_args* thread_args = (struct sm_multi_searchregions_thread_args*)args;
+    
+    /* count number of nodes */
+    int n_regions = 0;
+    element_t const *n;
+    for (n = thread_args->begin; n != thread_args->end; n = n->next) {
+        n_regions++;
+    }
+    /* reset n */
+    n = thread_args->begin;
+
+    // print thread id
+    printf("thread id: %d, begin: %p, end: %p, region count: %d\n", (int)syscall(SYS_gettid), thread_args->begin, thread_args->end, n_regions);
+
     unsigned long regnum = 0;
-    element_t *n = vars->regions->head;
-    region_t *r;
+    region_t const *r;
     unsigned long total_scan_bytes = 0;
     unsigned char *data = NULL;
 
-    if (sm_choose_scanroutine(vars->options.scan_data_type, match_type, uservalue, vars->options.reverse_endianness) == false)
-    {
-        show_error("unsupported scan for current data type.\n"); 
-        return false;
-    }
-
-    assert(sm_scan_routine);
-
-    /* stop and attach to the target */
-    if (sm_multi_attach(vars->target, &attach_state) == false)
-        return false;
-
-   
-    /* make sure we have some regions to search */
-    if (vars->regions->size == 0) {
-        show_warn("no regions defined, perhaps you deleted them all?\n");
-        show_info("use the \"reset\" command to refresh regions.\n");
-        return sm_detach(vars->target);
-    }
-
-    INTERRUPTABLESCAN();
-    
-    total_size = sizeof(matches_and_old_values_array);
-
-    while (n) {
-        total_size += ((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath);
-        n = n->next;
-    }
-    
-    total_size += sizeof(matches_and_old_values_swath); /* for null terminate */
-    
-    show_debug("allocate array, max size %ld\n", total_size);
-
-    if (!(vars->matches = allocate_array(vars->matches, total_size)))
-    {
-        show_error("could not allocate match array\n");
-        return false;
-    }
-    
-    writing_swath_index = vars->matches->swaths;
-    
-    writing_swath_index->first_byte_in_child = NULL;
-    writing_swath_index->number_of_bytes = 0;
-    
-    /* get total number of bytes */
-    for(n = vars->regions->head; n; n = n->next)
-        total_scan_bytes += ((region_t *)n->data)->size;
-
-    vars->scan_progress = 0.0;
-    vars->stop_flag = false;
-    n = vars->regions->head;
-
     /* check every memory region */
-    while (n) {
+    while (n != thread_args->end) {
         size_t bytes_remaining;
         size_t bytes_per_dot;
         double progress_per_dot;
@@ -581,9 +554,9 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         }
 
         /* print a progress meter so user knows we haven't crashed */
-        show_user("%02lu/%02lu searching %#10lx - %#10lx", ++regnum,
-                vars->regions->size, (unsigned long)r->start, (unsigned long)r->start + r->size);
-        fflush(stderr);
+        //show_user("%02lu/%02lu searching %#10lx - %#10lx", ++regnum,
+        //        vars->regions->size, (unsigned long)r->start, (unsigned long)r->start + r->size);
+        //fflush(stderr);
 
         /* For every offset, check if we have a match. */
         size_t memlength = r->size;
@@ -596,22 +569,24 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
             if (UNLIKELY(buffer_size == 0)) {
 
                 /* print a simple progress meter */
-                for ( ; memlength < bytes_remaining; bytes_remaining -= bytes_per_dot) {
-                    /* for user, just print a dot */
-                    print_a_dot();
-                    /* for front-end, update percentage */
-                    vars->scan_progress += progress_per_dot;
-                }
+                //for ( ; memlength < bytes_remaining; bytes_remaining -= bytes_per_dot) {
+                //    /* for user, just print a dot */
+                //    print_a_dot();
+                //    /* for front-end, update percentage */
+                //    vars->scan_progress += progress_per_dot;
+                //}
 
                 /* the whole region is finished */
                 if (memlength == 0) break;
 
                 /* stop scanning if asked to */
-                if (vars->stop_flag) break;
+                //if (vars->stop_flag) break;
 
                 /* load the next buffer block */
                 size_t read_size = MIN(memlength, MAX_ALLOC_SIZE);
-                size_t nread = sm_multi_readmemory(data, reg_pos, read_size, &attach_state);
+                // print read_size
+                //printf("read_size: %d\n", read_size);
+                size_t nread = sm_multi_readmemory(data, reg_pos, read_size, thread_args->attach_state);
                 if (nread < read_size) {
                     /* the region ends here, update `memlength` */
                     memlength = nread;
@@ -637,43 +612,196 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
             checkflags = flags_empty;
 
             /* check if we have a match */
-            match_length = (*sm_scan_routine)(memory_ptr, memlength, NULL, uservalue, &checkflags);
+            match_length = (*sm_scan_routine)(memory_ptr, memlength, NULL, thread_args->uservalue, &checkflags);
+            pthread_mutex_lock(thread_args->matches_mutex);
             if (UNLIKELY(match_length > 0))
             {
                 assert(match_length <= memlength);
-                writing_swath_index = add_element(&(vars->matches), writing_swath_index, reg_pos,
+                *thread_args->writing_swath_index = add_element(thread_args->matches, *thread_args->writing_swath_index, reg_pos,
                                                   get_u8b(memory_ptr), checkflags);
                 
-                ++vars->num_matches;
+                ++*(thread_args->num_matches);
                 
-                required_extra_bytes_to_record = match_length - 1;
+                thread_args->required_extra_bytes_to_record = match_length - 1;
             }
-            else if (required_extra_bytes_to_record)
+            else if (thread_args->required_extra_bytes_to_record)
             {
-                writing_swath_index = add_element(&(vars->matches), writing_swath_index, reg_pos,
+                *thread_args->writing_swath_index = add_element(thread_args->matches, *thread_args->writing_swath_index, reg_pos,
                                                   get_u8b(memory_ptr), flags_empty);
-                --required_extra_bytes_to_record;
+                --thread_args->required_extra_bytes_to_record;
             }
+            pthread_mutex_unlock(thread_args->matches_mutex);
 
         }
 
         free(data);
 
         /* stop scanning if asked to */
-        if (vars->stop_flag) {
-            printf("\n");
-            break;
-        }
+        //if (vars->stop_flag) {
+        //    printf("\n");
+        //    break;
+        //}
         n = n->next;
         show_user("ok\n");
     }
+}
+/* sm_searchregions() performs an initial search of the process for values matching `uservalue` */
+bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue)
+{
+    struct attach_state_t attach_state;
 
-    ENDINTERRUPTABLE();
+    pthread_mutex_t matches_mutex = PTHREAD_MUTEX_INITIALIZER;
+    matches_and_old_values_array **matches = &vars->matches;
+    matches_and_old_values_swath *writing_swath_index;
+    int required_extra_bytes_to_record = 0;
+
+    unsigned long total_size = 0;
+    unsigned long total_scan_bytes = 0;
+    element_t const *n = vars->regions->head;
+    
+    if (sm_choose_scanroutine(vars->options.scan_data_type, match_type, uservalue, vars->options.reverse_endianness) == false)
+    {
+        show_error("unsupported scan for current data type.\n"); 
+        return false;
+    }
+
+    assert(sm_scan_routine);
+
+    /* stop and attach to the target */
+    if (sm_multi_attach(vars->target, &attach_state) == false)
+        return false;
+
+   
+    /* make sure we have some regions to search */
+    if (vars->regions->size == 0) {
+        show_warn("no regions defined, perhaps you deleted them all?\n");
+        show_info("use the \"reset\" command to refresh regions.\n");
+        return sm_multi_detach(vars->target, &attach_state);
+    }
+
+    total_size = sizeof(matches_and_old_values_array);
+
+    while (n) {
+        total_size += ((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath);
+        n = n->next;
+    }
+    
+    total_size += sizeof(matches_and_old_values_swath); /* for null terminate */
+    
+    show_debug("allocate array, max size %ld\n", total_size);
+
+    if (!(*matches = allocate_array(*matches, total_size)))
+    {
+        show_error("could not allocate match array\n");
+        return false;
+    }
+    
+    writing_swath_index = (*matches)->swaths;
+    
+    writing_swath_index->first_byte_in_child = NULL;
+    writing_swath_index->number_of_bytes = 0;
+    
+    /* get total number of bytes */
+    for(n = vars->regions->head; n; n = n->next)
+        total_scan_bytes += ((region_t *)n->data)->size;
+
+    vars->scan_progress = 0.0;
+    vars->stop_flag = false;
+    n = vars->regions->head;
+
+    //INTERRUPTABLESCAN();
+
+    /* get number of threads to use */
+    int num_threads;
+    if (vars->options.num_parallel_jobs == 0) {
+        /* query os for number of cores */
+        num_threads = get_nprocs();
+    }
+    else {
+        num_threads = vars->options.num_parallel_jobs;
+    }
+
+    /* divide up regions for each thread */
+    /* if number of regions is smaller than number of threads, set number of threads to number of regions */
+    if (num_threads > vars->regions->size) {
+        num_threads = vars->regions->size;
+    }
+    const int regions_per_thread = vars->regions->size / num_threads;
+
+    /* create regions for each thread */
+    struct sm_multi_searchregions_thread_args* thread_args;
+    thread_args = malloc(num_threads * sizeof(struct sm_multi_searchregions_thread_args));
+    if (thread_args == NULL) {
+        show_error("could not allocate kernel_args array\n");
+        return false;
+    }
+    memset(thread_args, 0, num_threads * sizeof(struct sm_multi_searchregions_thread_args));
+    for (int i = 0; i < num_threads; i++) {
+        thread_args[i].attach_state = &attach_state;
+        thread_args[i].uservalue = uservalue;
+        thread_args[i].matches = matches;
+        thread_args[i].matches_mutex = &matches_mutex;
+        thread_args[i].writing_swath_index = &writing_swath_index;
+        thread_args[i].num_matches = &vars->num_matches;
+        thread_args[i].required_extra_bytes_to_record = &required_extra_bytes_to_record;
+    }
+
+    /* iterate over regions to find head and tails */
+    int thread_i = 0;
+    int n_regions = 0;
+    for(n = vars->regions->head; n; n = n->next) {
+        if (thread_args[thread_i].begin == NULL) {
+            thread_args[thread_i].begin = n;
+        }
+        n_regions++;
+        if (n_regions == regions_per_thread) {
+            thread_args[thread_i].end = n->next;
+            /* add leftover regions to last thread */
+            if (thread_i == num_threads - 1) {
+                thread_args[thread_i].end = NULL;
+                break;
+            }       
+            thread_i++;
+            n_regions = 0;
+        }
+    }
+    /* reset n */
+    n = vars->regions->head;
+
+    /* create threads */
+    pthread_t* threads;
+    threads = malloc(num_threads * sizeof(pthread_t));
+    if (threads == NULL) {
+        show_error("could not allocate threads array\n");
+        return false;
+    }
+    printf("creating %d threads\n", num_threads);
+    for (int i = 0; i < num_threads; i++) {
+        int ret = pthread_create(&threads[i], NULL, sm_multi_searchregions_thread_func, (void*)&thread_args[i]);
+        if (ret) {
+            show_error("could not create thread %d\n", i);
+            return false;
+        }
+    }
+
+    /* join threads */
+    for (int i = 0; i < num_threads; i++) {
+        int ret = pthread_join(threads[i], NULL);
+        if (ret) {
+            show_error("could not join thread %d\n", i);
+            return false;
+        }
+    }
+    free(threads);
+    free(thread_args);
+    printf("all threads joined\n");
+
+    //ENDINTERRUPTABLE();
 
     /* tell front-end we've finished */
     vars->scan_progress = MAX_PROGRESS;
     
-    if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
+    if (!(*matches = null_terminate((*matches), writing_swath_index)))
     {
         show_error("memory allocation error while reducing matches-array size\n");
         return false;
@@ -684,6 +812,281 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     /* okay, detach */
     return sm_multi_detach(vars->target, &attach_state);
 }
+
+#else
+struct sm_multi_searchregions_thread_args {
+    int thread_id;
+    int num_threads;
+    size_t search_stride;   // how many bytes to search at a time (for each thread)
+    size_t max_read_size;   // how many bytes to read at a time (for each thread), should be search_stride + max_vlt_size
+    size_t total_matches_size;     // total size of matches array
+
+    /**/
+    struct attach_state_t *attach_state;
+    const uservalue_t *uservalue;
+
+    /* head of regions to search */
+    element_t const *head;
+
+    /* output */
+    unsigned long num_matches;
+    matches_and_old_values_array *matches;
+    matches_and_old_values_swath *writing_swath_index;
+};
+
+static void sm_multi_searchregions_thread_func(void* args) {
+    struct sm_multi_searchregions_thread_args* thread_args = (struct sm_multi_searchregions_thread_args*)args;
+
+    int required_extra_bytes_to_record = 0;
+
+    /* create matches data structure for this thread */
+    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->total_matches_size)))
+    {
+        show_error("could not allocate match array\n");
+        return false;
+    }
+    
+    thread_args->writing_swath_index = thread_args->matches->swaths; 
+    thread_args->writing_swath_index->first_byte_in_child = NULL;
+    thread_args->writing_swath_index->number_of_bytes = 0;
+
+    element_t const *n = thread_args->head;
+
+    while (n) {
+        region_t const *r = (region_t const *)n->data;
+        unsigned char *data = NULL;
+        
+        /* allocate data array */
+        size_t alloc_size = MIN(r->size, thread_args->max_read_size);
+        if ((data = malloc(alloc_size * sizeof(char))) == NULL) {
+            show_error("sorry, there was a memory allocation error.\n");
+            return false;
+        }
+
+        /* For every offset, check if we have a match. */
+        for (size_t offset = (size_t)thread_args->thread_id * thread_args->search_stride; offset < r->size; offset += thread_args->search_stride * (size_t)thread_args->num_threads) {
+            void *reg_pos = r->start + offset;
+
+            /* load the next buffer block */
+            size_t read_size = MIN(r->size - offset, thread_args->max_read_size);
+            size_t nread = sm_multi_readmemory(data, reg_pos, read_size, thread_args->attach_state);
+            /* check if the read succeeded */
+            if ((nread == 0) && (offset == 0)) {
+                /* Failed on first read, which means region not exist. */
+                show_warn("reading region %02u failed.\n", r->start);
+                break;
+            }
+
+            int required_extra_bytes_to_record = 0;
+
+            /* search for matches */
+            size_t search_area = MIN(nread, thread_args->search_stride);
+            for (size_t i = 0; i < search_area; i++) {
+                const mem64_t* memory_ptr = (mem64_t*)(data + i);
+                unsigned int match_length;
+                match_flags checkflags;
+
+                /* initialize checkflags */
+                checkflags = flags_empty;
+                
+                /* check if we have a match */
+                match_length = (*sm_scan_routine)(memory_ptr, search_area - i, NULL, thread_args->uservalue, &checkflags);
+                
+                if (UNLIKELY(match_length > 0))
+                {
+                    assert(match_length <= nread);
+                    thread_args->writing_swath_index = add_element(&thread_args->matches, thread_args->writing_swath_index, reg_pos + i,
+                                                    get_u8b(memory_ptr), checkflags);
+                    
+                    thread_args->num_matches++;
+                    
+                    required_extra_bytes_to_record = match_length - 1;
+                }
+                else if (required_extra_bytes_to_record)
+                {
+                    thread_args->writing_swath_index = add_element(&thread_args->matches, thread_args->writing_swath_index, reg_pos + i,
+                                                    get_u8b(memory_ptr), flags_empty);
+                    --required_extra_bytes_to_record;
+                }
+                
+            }
+
+        }
+        
+        free(data);
+
+        n = n->next;
+        show_user("ok\n");
+    }
+
+    if (!(thread_args->matches = null_terminate(thread_args->matches, thread_args->writing_swath_index)))
+    {
+        show_error("memory allocation error while reducing matches-array size\n");
+        return false;
+    }
+
+}
+
+/* sm_searchregions() performs an initial search of the process for values matching `uservalue` */
+bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue)
+{
+    struct attach_state_t attach_state;
+
+    unsigned long total_matches_size = 0;
+    unsigned long total_scan_bytes = 0;
+    element_t const *n = vars->regions->head;    
+
+    /* select scanroutine */
+    if (sm_choose_scanroutine(vars->options.scan_data_type, match_type, uservalue, vars->options.reverse_endianness) == false)
+    {
+        show_error("unsupported scan for current data type.\n"); 
+        return false;
+    }
+
+    assert(sm_scan_routine);
+
+    /* stop and attach to the target */
+    if (sm_multi_attach(vars->target, &attach_state) == false)
+        return false;
+
+   
+    /* make sure we have some regions to search */
+    if (vars->regions->size == 0) {
+        show_warn("no regions defined, perhaps you deleted them all?\n");
+        show_info("use the \"reset\" command to refresh regions.\n");
+        return sm_multi_detach(vars->target, &attach_state);
+    }
+
+    total_matches_size = sizeof(matches_and_old_values_array);
+
+    while (n) {
+        total_matches_size += ((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath);
+        n = n->next;
+    }
+    
+    total_matches_size += sizeof(matches_and_old_values_swath); /* for null terminate */
+    
+    show_debug("allocate array, max size %ld\n", total_matches_size);
+    
+    /* get total number of bytes */
+    for(n = vars->regions->head; n; n = n->next)
+        total_scan_bytes += ((region_t *)n->data)->size;
+
+    vars->scan_progress = 0.0;
+    vars->stop_flag = false;
+    n = vars->regions->head;
+
+    /* The maximum logical size is a comfortable 1MiB (increasing it does not help).
+     * The actual allocation is that plus the rounded size of the maximum possible VLT.
+     * This is needed because the last byte might be scanned as max size VLT,
+     * thus need (2^16 - 2) extra bytes after it */
+#define MAX_BUFFER_SIZE (1<<20)
+#define MAX_ALLOC_SIZE  (MAX_BUFFER_SIZE + (1<<16))
+    
+    /* divide up work for each thread,
+       each thread will read a chunk of memory of size max_read_size (or less if near end of region),
+       however match searches will only start from offsets 0 to search_stride */
+    size_t search_stride = MAX_BUFFER_SIZE;
+    size_t max_read_size = MAX_ALLOC_SIZE;
+
+    /* get number of threads to use */
+    int num_threads;
+    if (vars->options.num_parallel_jobs == 0) {
+        /* query os for number of cores */
+        num_threads = get_nprocs();
+    }
+    else {
+        num_threads = vars->options.num_parallel_jobs;
+    }
+
+    /* if total bytes to read is less than num_threads * search_stride, reduce number of threads */
+    if (total_scan_bytes < num_threads * search_stride) {
+        num_threads = total_scan_bytes / search_stride;
+    }
+
+    /* create threads */
+    struct sm_multi_searchregions_thread_args* thread_args;
+    pthread_t* threads;
+
+    thread_args = malloc(num_threads * sizeof(struct sm_multi_searchregions_thread_args));
+    if (thread_args == NULL) {
+        show_error("could not allocate kernel_args array\n");
+        return false;
+    }
+
+    threads = malloc(num_threads * sizeof(pthread_t));
+    if (threads == NULL) {
+        show_error("could not allocate threads array\n");
+        return false;
+    }
+
+    for (int thread_id; thread_id < num_threads; thread_id++) {
+        thread_args[thread_id].thread_id = thread_id;
+        thread_args[thread_id].num_threads = num_threads;
+        thread_args[thread_id].search_stride = search_stride;
+        thread_args[thread_id].max_read_size = max_read_size;
+        thread_args[thread_id].total_matches_size = total_matches_size;
+        thread_args[thread_id].attach_state = &attach_state;
+        thread_args[thread_id].uservalue = uservalue;
+        thread_args[thread_id].head = n;
+        thread_args[thread_id].num_matches = 0;
+        thread_args[thread_id].matches = NULL;
+        thread_args[thread_id].writing_swath_index = NULL;
+    
+        int ret = pthread_create(&threads[thread_id], NULL, sm_multi_searchregions_thread_func, (void*)&thread_args[thread_id]);
+        if (ret) {
+            show_error("could not create thread %d\n", thread_id);
+            return false;
+        }
+    }
+    
+    /* allocate master swath array */
+    if (!(vars->matches = allocate_array(vars->matches, total_matches_size * num_threads)))
+    {
+        show_error("could not allocate match array\n");
+        return false;
+    }
+    matches_and_old_values_swath *writing_swath_index;
+    writing_swath_index = vars->matches->swaths;
+    writing_swath_index->first_byte_in_child = NULL;
+    writing_swath_index->number_of_bytes = 0;
+
+    /* join threads, sum up matches and merge matches */
+    for (int i = 0; i < num_threads; i++) {
+        int ret = pthread_join(threads[i], NULL);
+        if (ret) {
+            show_error("could not join thread %d\n", i);
+            return false;
+        }
+        
+        /* sum up matches */
+        vars->num_matches += thread_args[i].num_matches;
+
+        /* merge matches */
+        writing_swath_index = concat_array(&vars->matches, writing_swath_index, thread_args[i].matches);
+        free(thread_args[i].matches);
+    }
+
+    /* null terminate matches */
+    if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
+    {
+        show_error("memory allocation error while reducing matches-array size\n");
+        return false;
+    }
+    
+    free(threads);
+    free(thread_args);
+
+    show_info("we currently have %ld matches.\n", vars->num_matches);
+
+    /* okay, detach */
+    return sm_multi_detach(vars->target, &attach_state);
+}
+
+#endif
+
+
+
 
 #if 0
 

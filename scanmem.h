@@ -36,6 +36,7 @@
 #include "value.h"
 #include "targetmem.h"
 
+#define SCANMEM_MULTI_THREADING 1
 
 /* global settings */
 typedef struct {
@@ -61,9 +62,10 @@ typedef struct {
         unsigned short dump_with_ascii;
         unsigned short reverse_endianness;
         unsigned short no_ptrace;
-
+#if SCANMEM_MULTI_THREADING == 1
         /* multi threaded */
         int num_parallel_jobs; /* */
+#endif
     } options;
 } globals_t;
 
@@ -92,10 +94,10 @@ bool sm_attach(pid_t target);
 bool sm_read_array(pid_t target, const void *addr, void *buf, size_t len);
 bool sm_write_array(pid_t target, void *addr, const void *data, size_t len);
 
+#if SCANMEM_MULTI_THREADING == 1
 /* ptracemulti.c */
 bool sm_multi_checkmatches(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
 bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
-
-#define SCANMEM_MULTI_THREADING 1
+#endif
 
 #endif /* SCANMEM_H */

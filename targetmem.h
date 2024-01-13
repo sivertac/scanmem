@@ -250,6 +250,27 @@ add_element (matches_and_old_values_array **array,
     return swath;
 }
 
+/* returns the last empty swath in the array after the operation */
+static inline matches_and_old_values_swath * concat_array(matches_and_old_values_array **dest_array,
+             matches_and_old_values_swath *dest_swath, matches_and_old_values_array *source_array) {
+
+
+    /* resize dest_array to fit source_array */
+    *dest_array = allocate_enough_to_reach(*dest_array,
+        local_address_beyond_last_element(dest_swath) +
+        source_array->bytes_allocated, &dest_swath);
+    
+    /* copy source_array to dest_array */
+    memcpy(dest_swath, source_array->swaths, source_array->bytes_allocated);
+
+    /* iterate to find empty swath at end */
+    while (dest_swath->number_of_bytes != 0) {
+        dest_swath = local_address_beyond_last_element(dest_swath);
+    }
+
+    return dest_swath;
+}
+
 /* only at most sizeof(int64_t) bytes will be read,
    if more bytes are needed (e.g. bytearray),
    read them separately (for performance) */
