@@ -337,15 +337,17 @@ static inline uint16_t flags_to_memlength(scan_data_type_t scan_data_type, match
     }
 }
 
-struct sm_multi_checkmatches_thread_args {
-    pthread_t thread;
-    int thread_id;
-    int num_threads;
-
-    /**/
+struct sm_multi_checkmatches_thread_shared {
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
     scan_data_type_t scan_data_type;
+    int num_threads;
+};
+
+struct sm_multi_checkmatches_thread_args {
+    pthread_t thread;
+    int thread_id;
+    struct sm_multi_checkmatches_thread_shared* shared;
 
     /* input */
     matches_and_old_values_array *input_matches;
@@ -364,7 +366,7 @@ static void sm_multi_checkmatches_thread_func(void* args) {
     if (!(thread_args->output_matches = allocate_array(thread_args->output_matches, thread_args->input_matches->max_needed_bytes)))
     {
         show_error("could not allocate match array\n");
-        return false;
+        return;
     }
 
     matches_and_old_values_swath *writing_swath_index = thread_args->output_matches->swaths;
@@ -377,14 +379,14 @@ static void sm_multi_checkmatches_thread_func(void* args) {
     size_t swath_index = 0;
 
     while (reading_swath_index->number_of_bytes > 0) {
-        if (swath_index % thread_args->num_threads == thread_args->thread_id) {
+        if (swath_index % thread_args->shared->num_threads == thread_args->thread_id) {
 
             int required_extra_bytes_to_record = 0;
             size_t reading_iterator = 0;
             
             while (reading_iterator < reading_swath_index->number_of_bytes) {
                 match_flags old_flags = reading_swath_index->data[reading_iterator].match_info;
-                unsigned int old_length = flags_to_memlength(thread_args->scan_data_type, old_flags);
+                unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
                 void *address = reading_swath_index->first_byte_in_child + reading_iterator;
                 
                 /* read value from this address */
@@ -392,7 +394,7 @@ static void sm_multi_checkmatches_thread_func(void* args) {
                 const mem64_t *memory_ptr;
                 size_t memlength;
                 match_flags checkflags;
-                if (UNLIKELY(sm_multi_peekdata(&peekbuf, address, old_length, &memory_ptr, &memlength, thread_args->attach_state) == false))
+                if (UNLIKELY(sm_multi_peekdata(&peekbuf, address, old_length, &memory_ptr, &memlength, thread_args->shared->attach_state) == false))
                 {
                     /* If we can't look at the data here, just abort the whole recording, something bad happened */
                     required_extra_bytes_to_record = 0;
@@ -404,7 +406,7 @@ static void sm_multi_checkmatches_thread_func(void* args) {
 
                     checkflags = flags_empty;
 
-                    match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->uservalue, &checkflags);
+                    match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
                 }
 
                 if (match_length > 0)
@@ -465,9 +467,6 @@ bool sm_multi_checkmatches(globals_t *vars,
     if (sm_multi_attach(vars->target, &attach_state) == false)
         return false;
 
-    /* reset number of matches */
-    vars->num_matches = 0;
-
     matches_and_old_values_swath *tmp_swath_index = vars->matches->swaths;
     size_t number_of_swaths = 0;
 
@@ -503,12 +502,17 @@ bool sm_multi_checkmatches(globals_t *vars,
     }
     memset(thread_args, 0, num_threads * sizeof(struct sm_multi_checkmatches_thread_args));
 
+    struct sm_multi_checkmatches_thread_shared shared;
+    memset(&shared, 0, sizeof(shared));
+    shared.num_threads = num_threads;
+    shared.attach_state = &attach_state;
+    shared.uservalue = uservalue;
+    shared.scan_data_type = vars->options.scan_data_type;
+
     for (int thread_id = 0; thread_id < num_threads; thread_id++) {
         thread_args[thread_id].thread_id = thread_id;
-        thread_args[thread_id].num_threads = num_threads;
-        thread_args[thread_id].attach_state = &attach_state;
-        thread_args[thread_id].uservalue = uservalue;
-        thread_args[thread_id].scan_data_type = vars->options.scan_data_type;
+        thread_args[thread_id].shared = &shared;
+
         thread_args[thread_id].input_matches = vars->matches;
         thread_args[thread_id].num_matches = 0;
         thread_args[thread_id].output_matches = NULL;
@@ -534,6 +538,9 @@ bool sm_multi_checkmatches(globals_t *vars,
     writing_swath_index = new_matches->swaths;
     writing_swath_index->first_byte_in_child = NULL;
     writing_swath_index->number_of_bytes = 0;
+
+    /* reset number of matches before summing results from each thread */
+    vars->num_matches = 0;
 
     /* join threads, sum up matches and merge matches */
     for (int i = 0; i < num_threads; i++) {
@@ -573,19 +580,21 @@ bool sm_multi_checkmatches(globals_t *vars,
     return sm_multi_detach(vars->target, &attach_state);
 }
 
-struct sm_multi_searchregions_thread_args {
-    pthread_t thread;
-    int thread_id;
+struct sm_multi_searchregions_thread_shared {
     int num_threads;
     size_t search_stride;   // how many bytes to search at a time (for each thread)
     size_t max_read_size;   // how many bytes to read at a time (for each thread), should be search_stride + max_vlt_size
     size_t total_matches_size;     // total size of matches array
-
-    /**/
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
+};
 
-    /* head of regions to search */
+struct sm_multi_searchregions_thread_args {
+    pthread_t thread;
+    int thread_id;
+    struct sm_multi_searchregions_thread_shared* shared;
+    
+    /* input (head of regions to search) */
     element_t const *head;
 
     /* output */
@@ -600,7 +609,7 @@ static void sm_multi_searchregions_thread_func(void* args) {
     int required_extra_bytes_to_record = 0;
 
     /* create matches data structure for this thread */
-    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->total_matches_size)))
+    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size)))
     {
         show_error("could not allocate match array\n");
         return false;
@@ -617,19 +626,19 @@ static void sm_multi_searchregions_thread_func(void* args) {
         unsigned char *data = NULL;
         
         /* allocate data array */
-        size_t alloc_size = MIN(r->size, thread_args->max_read_size);
+        size_t alloc_size = MIN(r->size, thread_args->shared->max_read_size);
         if ((data = malloc(alloc_size * sizeof(char))) == NULL) {
             show_error("sorry, there was a memory allocation error.\n");
             return false;
         }
 
         /* For every offset, check if we have a match. */
-        for (size_t offset = (size_t)thread_args->thread_id * thread_args->search_stride; offset < r->size; offset += thread_args->search_stride * (size_t)thread_args->num_threads) {
+        for (size_t offset = (size_t)thread_args->thread_id * thread_args->shared->search_stride; offset < r->size; offset += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads) {
             void *reg_pos = r->start + offset;
 
             /* load the next buffer block */
-            size_t read_size = MIN(r->size - offset, thread_args->max_read_size);
-            size_t nread = sm_multi_readmemory(data, reg_pos, read_size, thread_args->attach_state);
+            size_t read_size = MIN(r->size - offset, thread_args->shared->max_read_size);
+            size_t nread = sm_multi_readmemory(data, reg_pos, read_size, thread_args->shared->attach_state);
             /* check if the read succeeded */
             if ((nread == 0) && (offset == 0)) {
                 /* Failed on first read, which means region not exist. */
@@ -640,7 +649,7 @@ static void sm_multi_searchregions_thread_func(void* args) {
             int required_extra_bytes_to_record = 0;
 
             /* search for matches */
-            size_t search_area = MIN(nread, thread_args->search_stride);
+            size_t search_area = MIN(nread, thread_args->shared->search_stride);
             for (size_t i = 0; i < search_area; i++) {
                 const mem64_t* memory_ptr = (mem64_t*)(data + i);
                 unsigned int match_length;
@@ -650,7 +659,7 @@ static void sm_multi_searchregions_thread_func(void* args) {
                 checkflags = flags_empty;
                 
                 /* check if we have a match */
-                match_length = (*sm_scan_routine)(memory_ptr, search_area - i, NULL, thread_args->uservalue, &checkflags);
+                match_length = (*sm_scan_routine)(memory_ptr, search_area - i, NULL, thread_args->shared->uservalue, &checkflags);
                 
                 if (UNLIKELY(match_length > 0))
                 {
@@ -774,14 +783,19 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         return false;
     }
 
+    struct sm_multi_searchregions_thread_shared shared;
+    memset(&shared, 0, sizeof(shared));
+    shared.num_threads = num_threads;
+    shared.search_stride = search_stride;
+    shared.max_read_size = max_read_size;
+    shared.total_matches_size = total_matches_size;
+    shared.attach_state = &attach_state;
+    shared.uservalue = uservalue;
+
     for (int thread_id = 0; thread_id < num_threads; thread_id++) {
         thread_args[thread_id].thread_id = thread_id;
-        thread_args[thread_id].num_threads = num_threads;
-        thread_args[thread_id].search_stride = search_stride;
-        thread_args[thread_id].max_read_size = max_read_size;
-        thread_args[thread_id].total_matches_size = total_matches_size;
-        thread_args[thread_id].attach_state = &attach_state;
-        thread_args[thread_id].uservalue = uservalue;
+        thread_args[thread_id].shared = &shared;
+
         thread_args[thread_id].head = n;
         thread_args[thread_id].num_matches = 0;
         thread_args[thread_id].matches = NULL;
