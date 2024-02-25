@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #include "scanmem.h"
 #include "commands.h"
@@ -244,5 +245,5 @@ double sm_get_scan_progress(void)
 
 void sm_set_stop_flag(bool stop_flag)
 {
-    sm_globals.stop_flag = stop_flag;
+    atomic_store(&sm_globals.stop_flag, stop_flag);
 }

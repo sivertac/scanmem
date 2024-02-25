@@ -49,6 +49,7 @@
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 // dirty hack for FreeBSD
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
@@ -342,6 +343,7 @@ struct sm_multi_checkmatches_thread_shared {
     const uservalue_t *uservalue;
     scan_data_type_t scan_data_type;
     int num_threads;
+    volatile _Atomic bool* stop_flag;
 };
 
 struct sm_multi_checkmatches_thread_args {
@@ -357,7 +359,7 @@ struct sm_multi_checkmatches_thread_args {
     matches_and_old_values_array *output_matches;
 };
 
-static void sm_multi_checkmatches_thread_func(void* args) {
+static void* sm_multi_checkmatches_thread_func(void* args) {
     struct sm_multi_checkmatches_thread_args* thread_args = (struct sm_multi_checkmatches_thread_args*)args;
     
     matches_and_old_values_swath *reading_swath_index = thread_args->input_matches->swaths;
@@ -366,7 +368,7 @@ static void sm_multi_checkmatches_thread_func(void* args) {
     if (!(thread_args->output_matches = allocate_array(thread_args->output_matches, thread_args->input_matches->max_needed_bytes)))
     {
         show_error("could not allocate match array\n");
-        return;
+        return NULL;
     }
 
     matches_and_old_values_swath *writing_swath_index = thread_args->output_matches->swaths;
@@ -377,6 +379,8 @@ static void sm_multi_checkmatches_thread_func(void* args) {
     memset(&peekbuf, 0, sizeof(peekbuf));
 
     size_t swath_index = 0;
+
+    bool stop_flag = false;
 
     while (reading_swath_index->number_of_bytes > 0) {
         if (swath_index % thread_args->shared->num_threads == thread_args->thread_id) {
@@ -438,13 +442,21 @@ static void sm_multi_checkmatches_thread_func(void* args) {
 
         reading_swath_index = local_address_beyond_last_element(reading_swath_index);
         swath_index++;
+
+        /* check if we are interrupted */
+        stop_flag = atomic_load(thread_args->shared->stop_flag);
+        if (stop_flag) {
+            break;
+        }
     }
 
     if (!(thread_args->output_matches = null_terminate(thread_args->output_matches, writing_swath_index)))
     {
         show_error("memory allocation error while reducing matches-array size\n");
-        return false;
+        return NULL;
     }
+
+    return NULL;
 }
 
 /* This is the function that handles when you enter a value (or >, <, =) for the second or later time (i.e. when there's already a list of matches);
@@ -466,6 +478,8 @@ bool sm_multi_checkmatches(globals_t *vars,
     /* stop and attach to the target */
     if (sm_multi_attach(vars->target, &attach_state) == false)
         return false;
+
+    INTERRUPTABLESCAN();
 
     matches_and_old_values_swath *tmp_swath_index = vars->matches->swaths;
     size_t number_of_swaths = 0;
@@ -493,7 +507,6 @@ bool sm_multi_checkmatches(globals_t *vars,
 
     /* create threads */
     struct sm_multi_checkmatches_thread_args* thread_args;
-    pthread_t* threads;
 
     thread_args = malloc(num_threads * sizeof(struct sm_multi_checkmatches_thread_args));
     if (thread_args == NULL) {
@@ -508,6 +521,7 @@ bool sm_multi_checkmatches(globals_t *vars,
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
     shared.scan_data_type = vars->options.scan_data_type;
+    shared.stop_flag = &vars->stop_flag;
 
     for (int thread_id = 0; thread_id < num_threads; thread_id++) {
         thread_args[thread_id].thread_id = thread_id;
@@ -561,13 +575,21 @@ bool sm_multi_checkmatches(globals_t *vars,
     free(vars->matches);
     vars->matches = new_matches;
     
-    //ENDINTERRUPTABLE();
+    /* store if we were interrupted */
+    bool interrupted_scan = atomic_load(&vars->stop_flag); 
 
-    //if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
-    //{
-    //    show_error("memory allocation error while reducing matches-array size\n");
-    //    return false;
-    //}
+    ENDINTERRUPTABLE();
+
+    /* null terminate matches */
+    if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
+    {
+        show_error("memory allocation error while reducing matches-array size\n");
+        return false;
+    }
+
+    if (interrupted_scan) {
+        show_info("interrupted check\n");
+    }
 
     show_user("ok\n");
 
@@ -582,11 +604,12 @@ bool sm_multi_checkmatches(globals_t *vars,
 
 struct sm_multi_searchregions_thread_shared {
     int num_threads;
-    size_t search_stride;   // how many bytes to search at a time (for each thread)
-    size_t max_read_size;   // how many bytes to read at a time (for each thread), should be search_stride + max_vlt_size
-    size_t total_matches_size;     // total size of matches array
+    size_t search_stride;           /* how many bytes to search at a time (for each thread) */
+    size_t max_read_size;           /* how many bytes to read at a time (for each thread), should be search_stride + max_vlt_size */
+    size_t total_matches_size;      /* total size of matches array */
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
+    volatile _Atomic bool* stop_flag;
 };
 
 struct sm_multi_searchregions_thread_args {
@@ -603,16 +626,14 @@ struct sm_multi_searchregions_thread_args {
     matches_and_old_values_swath *writing_swath_index;
 };
 
-static void sm_multi_searchregions_thread_func(void* args) {
+static void* sm_multi_searchregions_thread_func(void* args) {
     struct sm_multi_searchregions_thread_args* thread_args = (struct sm_multi_searchregions_thread_args*)args;
-
-    int required_extra_bytes_to_record = 0;
 
     /* create matches data structure for this thread */
     if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size)))
     {
         show_error("could not allocate match array\n");
-        return false;
+        return NULL;
     }
     
     thread_args->writing_swath_index = thread_args->matches->swaths; 
@@ -620,6 +641,8 @@ static void sm_multi_searchregions_thread_func(void* args) {
     thread_args->writing_swath_index->number_of_bytes = 0;
 
     element_t const *n = thread_args->head;
+
+    bool stop_flag = false;
 
     while (n) {
         region_t const *r = (region_t const *)n->data;
@@ -629,7 +652,7 @@ static void sm_multi_searchregions_thread_func(void* args) {
         size_t alloc_size = MIN(r->size, thread_args->shared->max_read_size);
         if ((data = malloc(alloc_size * sizeof(char))) == NULL) {
             show_error("sorry, there was a memory allocation error.\n");
-            return false;
+            return NULL;
         }
 
         /* For every offset, check if we have a match. */
@@ -680,20 +703,32 @@ static void sm_multi_searchregions_thread_func(void* args) {
                 
             }
 
+            /* check if we are interrupted */
+            stop_flag = atomic_load(thread_args->shared->stop_flag);
+            if (stop_flag) {
+                break;
+            }
         }
         
         free(data);
 
         n = n->next;
+
+        /* check if we are interrupted */
+        if (stop_flag) {
+            break;
+        }
+
         show_user("ok\n");
     }
 
     if (!(thread_args->matches = null_terminate(thread_args->matches, thread_args->writing_swath_index)))
     {
         show_error("memory allocation error while reducing matches-array size\n");
-        return false;
+        return NULL;
     }
 
+    return NULL;
 }
 
 /* sm_searchregions() performs an initial search of the process for values matching `uservalue` */
@@ -725,6 +760,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         show_info("use the \"reset\" command to refresh regions.\n");
         return sm_multi_detach(vars->target, &attach_state);
     }
+
+    INTERRUPTABLESCAN();
 
     total_matches_size = sizeof(matches_and_old_values_array);
 
@@ -775,7 +812,6 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 
     /* create threads */
     struct sm_multi_searchregions_thread_args* thread_args;
-    pthread_t* threads;
 
     thread_args = malloc(num_threads * sizeof(struct sm_multi_searchregions_thread_args));
     if (thread_args == NULL) {
@@ -791,6 +827,7 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     shared.total_matches_size = total_matches_size;
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
+    shared.stop_flag = &vars->stop_flag;
 
     for (int thread_id = 0; thread_id < num_threads; thread_id++) {
         thread_args[thread_id].thread_id = thread_id;
@@ -819,6 +856,9 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     writing_swath_index->first_byte_in_child = NULL;
     writing_swath_index->number_of_bytes = 0;
 
+    /* reset number of matches before summing results from each thread */
+    vars->num_matches = 0;
+
     /* join threads, sum up matches and merge matches */
     for (int i = 0; i < num_threads; i++) {
         int ret = pthread_join(thread_args[i].thread, NULL);
@@ -835,6 +875,11 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         free(thread_args[i].matches);
     }
 
+    /* store if we were interrupted */
+    bool interrupted_scan = atomic_load(&vars->stop_flag);
+
+    ENDINTERRUPTABLE();
+
     /* null terminate matches */
     if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
     {
@@ -843,6 +888,10 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     }
     
     free(thread_args);
+
+    if (interrupted_scan) {
+        show_info("interrupted check\n");
+    }
 
     show_info("we currently have %ld matches.\n", vars->num_matches);
 

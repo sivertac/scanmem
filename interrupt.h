@@ -59,6 +59,7 @@ do {                                                                \
         if (sigaction(SIGINT, &oldsig, NULL) == -1) {               \
             exit(EXIT_FAILURE);                                     \
         }                                                           \
+        sm_set_stop_flag(false);                                    \
     }                                                               \
     intr_used = 0;                                                  \
 } while (0)
