@@ -82,6 +82,7 @@ static const char help_text[] =
 "\n"
 "-p, --pid=pid\t\tset the target process pid\n"
 "-c, --command\t\trun given commands (separated by `;`)\n"
+"-j, --jobs=jobs\t\tspecifies the number of jobs (threads) to run simultaneously, if `0` then auto detect number of threads \n"
 "-h, --help\t\tprint this message\n"
 "-v, --version\t\tprint version information\n"
 "\n"
@@ -169,6 +170,7 @@ static void parse_parameters(int argc, char **argv, char **initial_commands, boo
     struct option longopts[] = {
         {"pid",     1, NULL, 'p'},      /* target pid */
         {"command", 1, NULL, 'c'},      /* commands to run at the beginning */
+        {"jobs",    1, NULL, 'j'},      /* number of jobs (threads) to run simultaneously */
         {"version", 0, NULL, 'v'},      /* print version */
         {"help",    0, NULL, 'h'},      /* print help summary */
         {"debug",   0, NULL, 'd'},      /* enable debug mode */
@@ -182,7 +184,7 @@ static void parse_parameters(int argc, char **argv, char **initial_commands, boo
 
     /* process command line */
     while (!done) {
-        switch (getopt_long(argc, argv, "vhdep:c:", longopts, &optindex)) {
+        switch (getopt_long(argc, argv, "vhdep:c:j:", longopts, &optindex)) {
             case 'p':
                 vars->target = (pid_t) strtoul(optarg, &end, 0);
 
@@ -194,6 +196,9 @@ static void parse_parameters(int argc, char **argv, char **initial_commands, boo
                 break;
             case 'c':
                 *initial_commands = optarg;
+                break;
+            case 'j':
+                vars->options.num_parallel_jobs = atoi(optarg);
                 break;
             case 'v':
                 printversion(stderr);

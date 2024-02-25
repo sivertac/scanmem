@@ -64,7 +64,7 @@ typedef struct {
         unsigned short no_ptrace;
 #if SCANMEM_MULTI_THREADING == 1
         /* multi threaded */
-        int num_parallel_jobs; /* */
+        int num_parallel_jobs; /* number of jobs (threads) to run simultaneously */
 #endif
     } options;
 } globals_t;
