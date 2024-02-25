@@ -343,9 +343,8 @@ struct sm_multi_checkmatches_thread_shared {
     const uservalue_t *uservalue;
     scan_data_type_t scan_data_type;
     int num_threads;
-    volatile _Atomic bool* stop_flag;
     size_t bytes_per_sample;
-    double* scan_progress;
+    globals_t *vars;
 };
 
 struct sm_multi_checkmatches_thread_args {
@@ -455,7 +454,7 @@ static void* sm_multi_checkmatches_thread_func(void* args) {
                 print_a_dot();
 
                 /* for front-end, update percentage */
-                *thread_args->shared->scan_progress += PROGRESS_PER_SAMPLE * SAMPLES_PER_DOT;
+                thread_args->shared->vars->scan_progress += PROGRESS_PER_SAMPLE * SAMPLES_PER_DOT;
                 
                 bytes_scanned_until_dot = 0;
             }
@@ -465,7 +464,7 @@ static void* sm_multi_checkmatches_thread_func(void* args) {
         swath_index++;
 
         /* check if we are interrupted */
-        stop_flag = atomic_load(thread_args->shared->stop_flag);
+        stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
         if (stop_flag) {
             break;
         }
@@ -552,9 +551,8 @@ bool sm_multi_checkmatches(globals_t *vars,
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
     shared.scan_data_type = vars->options.scan_data_type;
-    shared.stop_flag = &vars->stop_flag;
     shared.bytes_per_sample = total_scan_bytes / NUM_SAMPLES;
-    shared.scan_progress = &vars->scan_progress;
+    shared.vars = vars;
 
     for (int thread_id = 0; thread_id < num_threads; thread_id++) 
     {
@@ -599,7 +597,7 @@ bool sm_multi_checkmatches(globals_t *vars,
             return false;
         }
 
-        /* check if thread hit error */
+        /* check if thread failed */
         if (thread_args[i].error_str != NULL) 
         {
             show_error("thread %d hit error: %s\n", i, thread_args[i].error_str);
@@ -623,6 +621,7 @@ bool sm_multi_checkmatches(globals_t *vars,
 
     ENDINTERRUPTABLE();
 
+    /* if any thread failed */
     if (error) 
     {
         return false;
@@ -637,7 +636,7 @@ bool sm_multi_checkmatches(globals_t *vars,
 
     if (interrupted_scan) 
     {
-        show_info("interrupted check\n");
+        show_info("interrupted scan\n");
     }
 
     show_user("ok\n");
@@ -658,9 +657,8 @@ struct sm_multi_searchregions_thread_shared {
     size_t total_matches_size;      /* total size of matches array */
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
-    volatile _Atomic bool* stop_flag;
     size_t total_scan_bytes;
-    double* scan_progress;
+    globals_t *vars;
 };
 
 struct sm_multi_searchregions_thread_args {
@@ -695,7 +693,7 @@ static void* sm_multi_searchregions_thread_func(void* args) {
     thread_args->writing_swath_index->number_of_bytes = 0;
 
     element_t const *n = thread_args->head;
-
+    size_t regnum = 0;
     bool stop_flag = false;
 
     while (n) 
@@ -712,6 +710,14 @@ static void* sm_multi_searchregions_thread_func(void* args) {
         {
             thread_args->error_str = "sorry, there was a memory allocation error.\n";
             return NULL;
+        }
+
+        /* print a progress meter so user knows we haven't crashed */
+        if (thread_args->thread_id == 0)
+        {
+            show_user("%02lu/%02lu searching %#10lx - %#10lx", ++regnum,
+                    thread_args->shared->vars->regions->size, (unsigned long)r->start, (unsigned long)r->start + r->size);
+            fflush(stderr);
         }
 
         /* For every offset, check if we have a match. */
@@ -777,14 +783,14 @@ static void* sm_multi_searchregions_thread_func(void* args) {
                     /* for front-end, update percentage */
                     size_t bytes_per_dot = r->size / NUM_DOTS;
                     double progress_per_dot = (double)bytes_per_dot / thread_args->shared->total_scan_bytes;
-                    *thread_args->shared->scan_progress += progress_per_dot;
+                    thread_args->shared->vars->scan_progress += progress_per_dot;
 
                     bytes_scanned_until_dot = 0;
                 }
             }
 
             /* check if we are interrupted */
-            stop_flag = atomic_load(thread_args->shared->stop_flag);
+            stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
             if (stop_flag) 
             {
                 break;
@@ -919,9 +925,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     shared.total_matches_size = total_matches_size;
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
-    shared.stop_flag = &vars->stop_flag;
     shared.total_scan_bytes = total_scan_bytes;
-    shared.scan_progress = &vars->scan_progress;
+    shared.vars = vars;
 
     for (int thread_id = 0; thread_id < num_threads; thread_id++) 
     {
@@ -1003,7 +1008,7 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 
     if (interrupted_scan) 
     {
-        show_info("interrupted check\n");
+        show_info("interrupted scan\n");
     }
 
     /* tell front-end we've finished */
