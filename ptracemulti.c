@@ -357,6 +357,9 @@ struct sm_multi_checkmatches_thread_args {
     /* output */
     unsigned long num_matches;
     matches_and_old_values_array *output_matches;
+
+    /* error */
+    char const * error_str; /* NULL of no error */
 };
 
 static void* sm_multi_checkmatches_thread_func(void* args) {
@@ -367,7 +370,7 @@ static void* sm_multi_checkmatches_thread_func(void* args) {
     /* create matches data structure for this thread */
     if (!(thread_args->output_matches = allocate_array(thread_args->output_matches, thread_args->input_matches->max_needed_bytes)))
     {
-        show_error("could not allocate match array\n");
+        thread_args->error_str = "could not allocate match array";
         return NULL;
     }
 
@@ -452,7 +455,7 @@ static void* sm_multi_checkmatches_thread_func(void* args) {
 
     if (!(thread_args->output_matches = null_terminate(thread_args->output_matches, writing_swath_index)))
     {
-        show_error("memory allocation error while reducing matches-array size\n");
+        thread_args->error_str = "memory allocation error while reducing matches-array size";
         return NULL;
     }
 
@@ -530,6 +533,7 @@ bool sm_multi_checkmatches(globals_t *vars,
         thread_args[thread_id].input_matches = vars->matches;
         thread_args[thread_id].num_matches = 0;
         thread_args[thread_id].output_matches = NULL;
+        thread_args[thread_id].error_str = NULL;
     
         int ret = pthread_create(&thread_args[thread_id].thread, NULL, sm_multi_checkmatches_thread_func, (void*)&thread_args[thread_id]);
         if (ret) {
@@ -557,11 +561,19 @@ bool sm_multi_checkmatches(globals_t *vars,
     vars->num_matches = 0;
 
     /* join threads, sum up matches and merge matches */
+    bool error = false;
     for (int i = 0; i < num_threads; i++) {
         int ret = pthread_join(thread_args[i].thread, NULL);
         if (ret) {
             show_error("could not join thread %d\n", i);
             return false;
+        }
+
+        /* check if thread hit error */
+        if (thread_args[i].error_str != NULL) {
+            show_error("thread %d hit error: %s\n", i, thread_args[i].error_str);
+            error = true;
+            continue;
         }
         
         /* sum up matches */
@@ -579,6 +591,10 @@ bool sm_multi_checkmatches(globals_t *vars,
     bool interrupted_scan = atomic_load(&vars->stop_flag); 
 
     ENDINTERRUPTABLE();
+
+    if (error) {
+        return false;
+    }
 
     /* null terminate matches */
     if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
@@ -624,6 +640,9 @@ struct sm_multi_searchregions_thread_args {
     unsigned long num_matches;
     matches_and_old_values_array *matches;
     matches_and_old_values_swath *writing_swath_index;
+
+    /* error */
+    char const * error_str; /* NULL of no error */
 };
 
 static void* sm_multi_searchregions_thread_func(void* args) {
@@ -632,7 +651,7 @@ static void* sm_multi_searchregions_thread_func(void* args) {
     /* create matches data structure for this thread */
     if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size)))
     {
-        show_error("could not allocate match array\n");
+        thread_args->error_str = "could not allocate match array\n";
         return NULL;
     }
     
@@ -651,7 +670,7 @@ static void* sm_multi_searchregions_thread_func(void* args) {
         /* allocate data array */
         size_t alloc_size = MIN(r->size, thread_args->shared->max_read_size);
         if ((data = malloc(alloc_size * sizeof(char))) == NULL) {
-            show_error("sorry, there was a memory allocation error.\n");
+            thread_args->error_str = "sorry, there was a memory allocation error.\n";
             return NULL;
         }
 
@@ -724,7 +743,7 @@ static void* sm_multi_searchregions_thread_func(void* args) {
 
     if (!(thread_args->matches = null_terminate(thread_args->matches, thread_args->writing_swath_index)))
     {
-        show_error("memory allocation error while reducing matches-array size\n");
+        thread_args->error_str = "memory allocation error while reducing matches-array size\n";
         return NULL;
     }
 
@@ -818,6 +837,7 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         show_error("could not allocate kernel_args array\n");
         return false;
     }
+    memset(thread_args, 0, num_threads * sizeof(struct sm_multi_searchregions_thread_args));
 
     struct sm_multi_searchregions_thread_shared shared;
     memset(&shared, 0, sizeof(shared));
@@ -837,6 +857,7 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         thread_args[thread_id].num_matches = 0;
         thread_args[thread_id].matches = NULL;
         thread_args[thread_id].writing_swath_index = NULL;
+        thread_args[thread_id].error_str = NULL;
     
         int ret = pthread_create(&thread_args[thread_id].thread, NULL, sm_multi_searchregions_thread_func, (void*)&thread_args[thread_id]);
         if (ret) {
@@ -860,11 +881,19 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     vars->num_matches = 0;
 
     /* join threads, sum up matches and merge matches */
+    bool error = false;
     for (int i = 0; i < num_threads; i++) {
         int ret = pthread_join(thread_args[i].thread, NULL);
         if (ret) {
             show_error("could not join thread %d\n", i);
             return false;
+        }
+
+        /* check if thread hit error */
+        if (thread_args[i].error_str != NULL) {
+            show_error("thread %d hit error: %s\n", i, thread_args[i].error_str);
+            error = true;
+            continue;
         }
         
         /* sum up matches */
@@ -879,6 +908,10 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     bool interrupted_scan = atomic_load(&vars->stop_flag);
 
     ENDINTERRUPTABLE();
+
+    if (error) {
+        return false;
+    }
 
     /* null terminate matches */
     if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
