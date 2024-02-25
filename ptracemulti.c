@@ -344,6 +344,8 @@ struct sm_multi_checkmatches_thread_shared {
     scan_data_type_t scan_data_type;
     int num_threads;
     volatile _Atomic bool* stop_flag;
+    size_t bytes_per_sample;
+    double* scan_progress;
 };
 
 struct sm_multi_checkmatches_thread_args {
@@ -382,7 +384,7 @@ static void* sm_multi_checkmatches_thread_func(void* args) {
     memset(&peekbuf, 0, sizeof(peekbuf));
 
     size_t swath_index = 0;
-
+    size_t bytes_scanned_until_dot = 0;
     bool stop_flag = false;
 
     while (reading_swath_index->number_of_bytes > 0) {
@@ -443,6 +445,22 @@ static void* sm_multi_checkmatches_thread_func(void* args) {
             }
         }
 
+        /* calculate progress */
+        if (thread_args->thread_id == 0) 
+        {
+            bytes_scanned_until_dot += reading_swath_index->number_of_bytes;
+            if (bytes_scanned_until_dot >= thread_args->shared->bytes_per_sample * SAMPLES_PER_DOT) 
+            {
+                /* for user, just print a dot */
+                print_a_dot();
+
+                /* for front-end, update percentage */
+                *thread_args->shared->scan_progress += PROGRESS_PER_SAMPLE * SAMPLES_PER_DOT;
+                
+                bytes_scanned_until_dot = 0;
+            }
+        }
+
         reading_swath_index = local_address_beyond_last_element(reading_swath_index);
         swath_index++;
 
@@ -484,27 +502,36 @@ bool sm_multi_checkmatches(globals_t *vars,
 
     INTERRUPTABLESCAN();
 
+    /* reset number of matches before summing results from each thread */
+    vars->num_matches = 0;
+    vars->scan_progress = 0.0;
+
     matches_and_old_values_swath *tmp_swath_index = vars->matches->swaths;
     size_t number_of_swaths = 0;
+    size_t total_scan_bytes = 0;
 
     while(tmp_swath_index->number_of_bytes)
     {
         number_of_swaths++;
+        total_scan_bytes += tmp_swath_index->number_of_bytes;
         tmp_swath_index = (matches_and_old_values_swath *)(&tmp_swath_index->data[tmp_swath_index->number_of_bytes]);
     }
 
     /* get number of threads to use */
     int num_threads;
-    if (vars->options.num_parallel_jobs == 0) {
+    if (vars->options.num_parallel_jobs == 0) 
+    {
         /* query os for number of cores */
         num_threads = get_nprocs();
     }
-    else {
+    else 
+    {
         num_threads = vars->options.num_parallel_jobs;
     }
 
     /* if number_of_swaths is less than threads, reduce number of threads */
-    if (number_of_swaths < num_threads) {
+    if (number_of_swaths < num_threads) 
+    {
         num_threads = number_of_swaths;
     }
 
@@ -512,7 +539,8 @@ bool sm_multi_checkmatches(globals_t *vars,
     struct sm_multi_checkmatches_thread_args* thread_args;
 
     thread_args = malloc(num_threads * sizeof(struct sm_multi_checkmatches_thread_args));
-    if (thread_args == NULL) {
+    if (thread_args == NULL) 
+    {
         show_error("could not allocate kernel_args array\n");
         return false;
     }
@@ -525,8 +553,11 @@ bool sm_multi_checkmatches(globals_t *vars,
     shared.uservalue = uservalue;
     shared.scan_data_type = vars->options.scan_data_type;
     shared.stop_flag = &vars->stop_flag;
+    shared.bytes_per_sample = total_scan_bytes / NUM_SAMPLES;
+    shared.scan_progress = &vars->scan_progress;
 
-    for (int thread_id = 0; thread_id < num_threads; thread_id++) {
+    for (int thread_id = 0; thread_id < num_threads; thread_id++) 
+    {
         thread_args[thread_id].thread_id = thread_id;
         thread_args[thread_id].shared = &shared;
 
@@ -557,20 +588,20 @@ bool sm_multi_checkmatches(globals_t *vars,
     writing_swath_index->first_byte_in_child = NULL;
     writing_swath_index->number_of_bytes = 0;
 
-    /* reset number of matches before summing results from each thread */
-    vars->num_matches = 0;
-
     /* join threads, sum up matches and merge matches */
     bool error = false;
-    for (int i = 0; i < num_threads; i++) {
+    for (int i = 0; i < num_threads; i++) 
+    {
         int ret = pthread_join(thread_args[i].thread, NULL);
-        if (ret) {
+        if (ret) 
+        {
             show_error("could not join thread %d\n", i);
             return false;
         }
 
         /* check if thread hit error */
-        if (thread_args[i].error_str != NULL) {
+        if (thread_args[i].error_str != NULL) 
+        {
             show_error("thread %d hit error: %s\n", i, thread_args[i].error_str);
             error = true;
             continue;
@@ -592,7 +623,8 @@ bool sm_multi_checkmatches(globals_t *vars,
 
     ENDINTERRUPTABLE();
 
-    if (error) {
+    if (error) 
+    {
         return false;
     }
 
@@ -603,7 +635,8 @@ bool sm_multi_checkmatches(globals_t *vars,
         return false;
     }
 
-    if (interrupted_scan) {
+    if (interrupted_scan) 
+    {
         show_info("interrupted check\n");
     }
 
@@ -626,6 +659,8 @@ struct sm_multi_searchregions_thread_shared {
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
     volatile _Atomic bool* stop_flag;
+    size_t total_scan_bytes;
+    double* scan_progress;
 };
 
 struct sm_multi_searchregions_thread_args {
@@ -663,26 +698,33 @@ static void* sm_multi_searchregions_thread_func(void* args) {
 
     bool stop_flag = false;
 
-    while (n) {
+    while (n) 
+    {
         region_t const *r = (region_t const *)n->data;
         unsigned char *data = NULL;
+
+        size_t bytes_per_sample = r->size / NUM_SAMPLES;
+        size_t bytes_scanned_until_dot = 0;
         
         /* allocate data array */
         size_t alloc_size = MIN(r->size, thread_args->shared->max_read_size);
-        if ((data = malloc(alloc_size * sizeof(char))) == NULL) {
+        if ((data = malloc(alloc_size * sizeof(char))) == NULL) 
+        {
             thread_args->error_str = "sorry, there was a memory allocation error.\n";
             return NULL;
         }
 
         /* For every offset, check if we have a match. */
-        for (size_t offset = (size_t)thread_args->thread_id * thread_args->shared->search_stride; offset < r->size; offset += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads) {
+        for (size_t offset = (size_t)thread_args->thread_id * thread_args->shared->search_stride; offset < r->size; offset += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads) 
+        {
             void *reg_pos = r->start + offset;
 
             /* load the next buffer block */
             size_t read_size = MIN(r->size - offset, thread_args->shared->max_read_size);
             size_t nread = sm_multi_readmemory(data, reg_pos, read_size, thread_args->shared->attach_state);
             /* check if the read succeeded */
-            if ((nread == 0) && (offset == 0)) {
+            if ((nread == 0) && (offset == 0)) 
+            {
                 /* Failed on first read, which means region not exist. */
                 show_warn("reading region %02u failed.\n", r->start);
                 break;
@@ -692,7 +734,8 @@ static void* sm_multi_searchregions_thread_func(void* args) {
 
             /* search for matches */
             size_t search_area = MIN(nread, thread_args->shared->search_stride);
-            for (size_t i = 0; i < search_area; i++) {
+            for (size_t i = 0; i < search_area; i++) 
+            {
                 const mem64_t* memory_ptr = (mem64_t*)(data + i);
                 unsigned int match_length;
                 match_flags checkflags;
@@ -722,9 +765,28 @@ static void* sm_multi_searchregions_thread_func(void* args) {
                 
             }
 
+            /* calculate progress */
+            if (thread_args->thread_id == 0) 
+            {
+                bytes_scanned_until_dot += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads; /* approximation */
+                if (bytes_scanned_until_dot >= bytes_per_sample * SAMPLES_PER_DOT) 
+                {
+                    /* for user, just print a dot */
+                    print_a_dot();
+                    
+                    /* for front-end, update percentage */
+                    size_t bytes_per_dot = r->size / NUM_DOTS;
+                    double progress_per_dot = (double)bytes_per_dot / thread_args->shared->total_scan_bytes;
+                    *thread_args->shared->scan_progress += progress_per_dot;
+
+                    bytes_scanned_until_dot = 0;
+                }
+            }
+
             /* check if we are interrupted */
             stop_flag = atomic_load(thread_args->shared->stop_flag);
-            if (stop_flag) {
+            if (stop_flag) 
+            {
                 break;
             }
         }
@@ -734,11 +796,15 @@ static void* sm_multi_searchregions_thread_func(void* args) {
         n = n->next;
 
         /* check if we are interrupted */
-        if (stop_flag) {
+        if (stop_flag) 
+        {
             break;
         }
 
-        show_user("ok\n");
+        if (thread_args->thread_id == 0) 
+        {
+            show_user("ok\n");
+        }  
     }
 
     if (!(thread_args->matches = null_terminate(thread_args->matches, thread_args->writing_swath_index)))
@@ -755,8 +821,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 {
     struct attach_state_t attach_state;
 
-    unsigned long total_matches_size = 0;
-    unsigned long total_scan_bytes = 0;
+    size_t total_matches_size = 0;
+    size_t total_scan_bytes = 0;
     element_t const *n = vars->regions->head;    
 
     /* select scanroutine */
@@ -774,7 +840,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 
    
     /* make sure we have some regions to search */
-    if (vars->regions->size == 0) {
+    if (vars->regions->size == 0) 
+    {
         show_warn("no regions defined, perhaps you deleted them all?\n");
         show_info("use the \"reset\" command to refresh regions.\n");
         return sm_multi_detach(vars->target, &attach_state);
@@ -784,7 +851,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 
     total_matches_size = sizeof(matches_and_old_values_array);
 
-    while (n) {
+    while (n) 
+    {
         total_matches_size += ((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath);
         n = n->next;
     }
@@ -816,16 +884,19 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 
     /* get number of threads to use */
     int num_threads;
-    if (vars->options.num_parallel_jobs == 0) {
+    if (vars->options.num_parallel_jobs == 0) 
+    {
         /* query os for number of cores */
         num_threads = get_nprocs();
     }
-    else {
+    else 
+    {
         num_threads = vars->options.num_parallel_jobs;
     }
 
     /* if total bytes to read is less than num_threads * search_stride, reduce number of threads */
-    if (total_scan_bytes < num_threads * search_stride) {
+    if (total_scan_bytes < num_threads * search_stride) 
+    {
         num_threads = total_scan_bytes / search_stride;
     }
 
@@ -833,7 +904,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     struct sm_multi_searchregions_thread_args* thread_args;
 
     thread_args = malloc(num_threads * sizeof(struct sm_multi_searchregions_thread_args));
-    if (thread_args == NULL) {
+    if (thread_args == NULL) 
+    {
         show_error("could not allocate kernel_args array\n");
         return false;
     }
@@ -848,8 +920,11 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
     shared.stop_flag = &vars->stop_flag;
+    shared.total_scan_bytes = total_scan_bytes;
+    shared.scan_progress = &vars->scan_progress;
 
-    for (int thread_id = 0; thread_id < num_threads; thread_id++) {
+    for (int thread_id = 0; thread_id < num_threads; thread_id++) 
+    {
         thread_args[thread_id].thread_id = thread_id;
         thread_args[thread_id].shared = &shared;
 
@@ -860,7 +935,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         thread_args[thread_id].error_str = NULL;
     
         int ret = pthread_create(&thread_args[thread_id].thread, NULL, sm_multi_searchregions_thread_func, (void*)&thread_args[thread_id]);
-        if (ret) {
+        if (ret) 
+        {
             show_error("could not create thread %d\n", thread_id);
             return false;
         }
@@ -882,7 +958,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 
     /* join threads, sum up matches and merge matches */
     bool error = false;
-    for (int i = 0; i < num_threads; i++) {
+    for (int i = 0; i < num_threads; i++) 
+    {
         int ret = pthread_join(thread_args[i].thread, NULL);
         if (ret) {
             show_error("could not join thread %d\n", i);
@@ -890,7 +967,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
         }
 
         /* check if thread hit error */
-        if (thread_args[i].error_str != NULL) {
+        if (thread_args[i].error_str != NULL) 
+        {
             show_error("thread %d hit error: %s\n", i, thread_args[i].error_str);
             error = true;
             continue;
@@ -909,7 +987,8 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
 
     ENDINTERRUPTABLE();
 
-    if (error) {
+    if (error) 
+    {
         return false;
     }
 
@@ -922,9 +1001,13 @@ bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const
     
     free(thread_args);
 
-    if (interrupted_scan) {
+    if (interrupted_scan) 
+    {
         show_info("interrupted check\n");
     }
+
+    /* tell front-end we've finished */
+    vars->scan_progress = MAX_PROGRESS;
 
     show_info("we currently have %ld matches.\n", vars->num_matches);
 
