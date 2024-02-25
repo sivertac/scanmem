@@ -254,14 +254,13 @@ add_element (matches_and_old_values_array **array,
 static inline matches_and_old_values_swath * concat_array(matches_and_old_values_array **dest_array,
              matches_and_old_values_swath *dest_swath, matches_and_old_values_array *source_array) {
 
-
     /* resize dest_array to fit source_array */
     *dest_array = allocate_enough_to_reach(*dest_array,
         local_address_beyond_last_element(dest_swath) +
-        source_array->bytes_allocated, &dest_swath);
-    
+        source_array->bytes_allocated - offsetof(matches_and_old_values_array, swaths), &dest_swath);
+
     /* copy source_array to dest_array */
-    memcpy(dest_swath, source_array->swaths, source_array->bytes_allocated);
+    memcpy(dest_swath, source_array->swaths, source_array->bytes_allocated - offsetof(matches_and_old_values_array, swaths));
 
     /* iterate to find empty swath at end */
     while (dest_swath->number_of_bytes != 0) {

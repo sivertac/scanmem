@@ -591,6 +591,8 @@ bool sm_checkmatches(globals_t *vars,
         free(thread_args[i].output_matches);
     }
 
+    free(thread_args);
+
     free(vars->matches);
     vars->matches = new_matches;
     
@@ -966,6 +968,8 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
         free(thread_args[i].matches);
     }
 
+    free(thread_args);
+
     /* store if we were interrupted */
     bool interrupted_scan = atomic_load(&vars->stop_flag);
 
@@ -982,8 +986,6 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
         show_error("memory allocation error while reducing matches-array size\n");
         return false;
     }
-    
-    free(thread_args);
 
     if (interrupted_scan) 
     {
