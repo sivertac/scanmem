@@ -83,21 +83,40 @@ double sm_get_scan_progress(void);
 void sm_set_stop_flag(bool stop_flag);
 
 /* ptrace.c */
-bool sm_detach(pid_t target);
+/* ptrace peek buffer, used by peekdata() as a mirror of the process memory.
+ * Max size is the maximum allowed rounded VLT scan length, aka UINT16_MAX,
+ * plus a `PEEKDATA_CHUNK`, to store a full extra chunk for maneuverability */
+#if HAVE_PROCMEM
+# define PEEKDATA_CHUNK 2048
+#else
+# define PEEKDATA_CHUNK sizeof(long)
+#endif
+#define MAX_PEEKBUF_SIZE ((1<<16) + PEEKDATA_CHUNK)
+struct peekbuf_t {
+    uint8_t cache[MAX_PEEKBUF_SIZE];  /* read from ptrace()  */
+    unsigned size;              /* amount of valid memory stored (in bytes) */
+    const char *base;           /* base address of cached region */
+#if HAVE_PROCMEM
+    int procmem_fd;             /* file descriptor of the opened `/proc/<pid>/mem` file */
+#else
+    pid_t pid;                  /* pid of scanned process */
+#endif
+};
+
+struct attach_state_t {
+#if HAVE_PROCMEM
+    int procmem_fd;             /* file descriptor of the opened `/proc/<pid>/mem` file */
+#endif
+    pid_t pid;                  /* pid of scanned process */
+};
+
+bool sm_detach(pid_t target, struct attach_state_t* attach_state);
 bool sm_setaddr(pid_t target, void *addr, const value_t *to);
-bool sm_checkmatches(globals_t *vars, scan_match_type_t match_type,
-                     const uservalue_t *uservalue);
-bool sm_searchregions(globals_t *vars, scan_match_type_t match_type,
-                      const uservalue_t *uservalue);
-bool sm_peekdata(const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength);
-bool sm_attach(pid_t target);
+bool sm_checkmatches(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
+bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
+bool sm_peekdata(struct peekbuf_t* peekbuf, const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength, struct attach_state_t* attach_state);
+bool sm_attach(pid_t target, struct attach_state_t* attach_state);
 bool sm_read_array(pid_t target, const void *addr, void *buf, size_t len);
 bool sm_write_array(pid_t target, void *addr, const void *data, size_t len);
-
-#if SCANMEM_MULTI_THREADING == 1
-/* ptracemulti.c */
-bool sm_multi_checkmatches(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
-bool sm_multi_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue);
-#endif
 
 #endif /* SCANMEM_H */

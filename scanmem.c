@@ -212,7 +212,7 @@ void sm_cleanup(void)
         free(sm_globals.matches);
 
     /* attempt to detach just in case */
-    sm_detach(sm_globals.target);
+    sm_detach(sm_globals.target, NULL);
 }
 
 /* for front-ends */

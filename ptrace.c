@@ -46,6 +46,10 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <sys/sysinfo.h>
+#include <sys/syscall.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 // dirty hack for FreeBSD
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
@@ -73,28 +77,7 @@
 #define SAMPLES_PER_DOT (NUM_SAMPLES / NUM_DOTS)
 #define PROGRESS_PER_SAMPLE (MAX_PROGRESS / NUM_SAMPLES)
 
-/* ptrace peek buffer, used by peekdata() as a mirror of the process memory.
- * Max size is the maximum allowed rounded VLT scan length, aka UINT16_MAX,
- * plus a `PEEKDATA_CHUNK`, to store a full extra chunk for maneuverability */
-#if HAVE_PROCMEM
-# define PEEKDATA_CHUNK 2048
-#else
-# define PEEKDATA_CHUNK sizeof(long)
-#endif
-#define MAX_PEEKBUF_SIZE ((1<<16) + PEEKDATA_CHUNK)
-static struct {
-    uint8_t cache[MAX_PEEKBUF_SIZE];  /* read from ptrace()  */
-    unsigned size;              /* amount of valid memory stored (in bytes) */
-    const char *base;           /* base address of cached region */
-#if HAVE_PROCMEM
-    int procmem_fd;             /* file descriptor of the opened `/proc/<pid>/mem` file */
-#else
-    pid_t pid;                  /* pid of scanned process */
-#endif
-} peekbuf;
-
-
-bool sm_attach(pid_t target)
+bool sm_attach(pid_t target, struct attach_state_t* attach_state)
 {
     if (!sm_globals.options.no_ptrace)
     {
@@ -114,10 +97,6 @@ bool sm_attach(pid_t target)
         }
     }
 
-    /* reset the peek buffer */
-    peekbuf.size = 0;
-    peekbuf.base = NULL;
-
 #if HAVE_PROCMEM
     { /* open the `/proc/<pid>/mem` file */
         char mem[32];
@@ -131,22 +110,24 @@ bool sm_attach(pid_t target)
             show_error("unable to open %s.\n", mem);
             return false;
         }
-        peekbuf.procmem_fd = fd;
+        attach_state->procmem_fd = fd;
     }
-#else
-    peekbuf.pid = target;
 #endif
+    attach_state->pid = target;
 
     /* everything looks okay */
     return true;
 
 }
 
-bool sm_detach(pid_t target)
+bool sm_detach(pid_t target, struct attach_state_t* attach_state)
 {
 #if HAVE_PROCMEM
-    /* close the mem file before detaching */
-    close(peekbuf.procmem_fd);
+    if (attach_state != NULL)
+    {
+        /* close the mem file before detaching */
+        close(attach_state->procmem_fd);
+    }
 #endif
 
     if (!sm_globals.options.no_ptrace)
@@ -161,18 +142,17 @@ bool sm_detach(pid_t target)
     }
 }
 
-
 /* Reads data from the target process, and places it on the `dest_buffer`
  * using either `ptrace` or `pread` on `/proc/pid/mem`.
  * The target process is not passed, but read from the static peekbuf.
  * `sm_attach()` MUST be called before this function. */
-static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address, size_t size)
+static inline size_t sm_readmemory(uint8_t *dest_buffer, const char *target_address, size_t size, struct attach_state_t* attach_state)
 {
     size_t nread = 0;
 
 #if HAVE_PROCMEM
     do {
-        ssize_t ret = pread(peekbuf.procmem_fd, dest_buffer + nread,
+        ssize_t ret = pread(attach_state->procmem_fd, dest_buffer + nread,
                             size - nread, (unsigned long)(target_address + nread));
         if (ret == -1) {
             /* we can't read further, report what was read */
@@ -190,7 +170,7 @@ static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address
     errno = 0;
     for (nread = 0; nread < size; nread += sizeof(long)) {
         const char *ptrace_address = target_address + nread;
-        long ptraced_long = ptrace(PTRACE_PEEKDATA, peekbuf.pid, ptrace_address, NULL);
+        long ptraced_long = ptrace(PTRACE_PEEKDATA, attach_state->pid, ptrace_address, NULL);
 
         /* check if ptrace() succeeded */
         if (UNLIKELY(ptraced_long == -1L && errno != 0)) {
@@ -200,7 +180,7 @@ static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address
                 /* read backwards until we get a good read, then shift out the right value */
                 for (j = 1, errno = 0; j < sizeof(long); j++, errno = 0) {
                     /* try for a shifted ptrace - 'continue' (i.e. try an increased shift) if it fails */
-                    ptraced_long = ptrace(PTRACE_PEEKDATA, peekbuf.pid, ptrace_address - j, NULL);
+                    ptraced_long = ptrace(PTRACE_PEEKDATA, attach_state->pid, ptrace_address - j, NULL);
                     if ((ptraced_long == -1L) && (errno == EIO || errno == EFAULT))
                         continue;
 
@@ -231,61 +211,61 @@ static inline size_t readmemory(uint8_t *dest_buffer, const char *target_address
  * `sm_attach()` MUST be called before this function.
  */
 
-extern inline bool sm_peekdata(const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength)
+inline bool sm_peekdata(struct peekbuf_t* peekbuf, const void *addr, uint16_t length, const mem64_t **result_ptr, size_t *memlength, struct attach_state_t* attach_state)
 {
     const char *reqaddr = addr;
     unsigned int i;
     unsigned int missing_bytes;
 
-    assert(peekbuf.size <= MAX_PEEKBUF_SIZE);
+    assert(peekbuf->size <= MAX_PEEKBUF_SIZE);
     assert(result_ptr != NULL);
     assert(memlength != NULL);
 
     /* check if we have a full cache hit */
-    if (peekbuf.base != NULL &&
-        reqaddr >= peekbuf.base &&
-        (unsigned long) (reqaddr + length - peekbuf.base) <= peekbuf.size)
+    if (peekbuf->base != NULL &&
+        reqaddr >= peekbuf->base &&
+        (unsigned long) (reqaddr + length - peekbuf->base) <= peekbuf->size)
     {
-        *result_ptr = (mem64_t*)&peekbuf.cache[reqaddr - peekbuf.base];
-        *memlength = peekbuf.base - reqaddr + peekbuf.size;
+        *result_ptr = (mem64_t*)&peekbuf->cache[reqaddr - peekbuf->base];
+        *memlength = peekbuf->base - reqaddr + peekbuf->size;
         return true;
     }
-    else if (peekbuf.base != NULL &&
-             reqaddr >= peekbuf.base &&
-             (unsigned long) (reqaddr - peekbuf.base) < peekbuf.size)
+    else if (peekbuf->base != NULL &&
+             reqaddr >= peekbuf->base &&
+             (unsigned long) (reqaddr - peekbuf->base) < peekbuf->size)
     {
-        assert(peekbuf.size != 0);
+        assert(peekbuf->size != 0);
 
         /* partial hit, we have some of the data but not all, so remove old entries - shift the frame by as far as is necessary */
-        missing_bytes = (reqaddr + length) - (peekbuf.base + peekbuf.size);
+        missing_bytes = (reqaddr + length) - (peekbuf->base + peekbuf->size);
         /* round up to the nearest PEEKDATA_CHUNK multiple, that is what could
          * potentially be read and we have to fit it all */
         missing_bytes = PEEKDATA_CHUNK * (1 + (missing_bytes-1) / PEEKDATA_CHUNK);
 
         /* head shift if necessary */
-        if (peekbuf.size + missing_bytes > MAX_PEEKBUF_SIZE)
+        if (peekbuf->size + missing_bytes > MAX_PEEKBUF_SIZE)
         {
-            unsigned int shift_size = reqaddr - peekbuf.base;
+            unsigned int shift_size = reqaddr - peekbuf->base;
             shift_size = PEEKDATA_CHUNK * (shift_size / PEEKDATA_CHUNK);
 
-            memmove(peekbuf.cache, &peekbuf.cache[shift_size], peekbuf.size-shift_size);
+            memmove(peekbuf->cache, &peekbuf->cache[shift_size], peekbuf->size-shift_size);
 
-            peekbuf.size -= shift_size;
-            peekbuf.base += shift_size;
+            peekbuf->size -= shift_size;
+            peekbuf->base += shift_size;
         }
     }
     else {
         /* cache miss, invalidate the cache */
         missing_bytes = length;
-        peekbuf.size = 0;
-        peekbuf.base = reqaddr;
+        peekbuf->size = 0;
+        peekbuf->base = reqaddr;
     }
 
     /* we need to retrieve memory to complete the request */
     for (i = 0; i < missing_bytes; i += PEEKDATA_CHUNK)
     {
-        const char *target_address = peekbuf.base + peekbuf.size;
-        size_t len = readmemory(&peekbuf.cache[peekbuf.size], target_address, PEEKDATA_CHUNK);
+        const char *target_address = peekbuf->base + peekbuf->size;
+        size_t len = sm_readmemory(&peekbuf->cache[peekbuf->size], target_address, PEEKDATA_CHUNK, attach_state);
 
         /* check if the read succeeded */
         if (UNLIKELY(len < PEEKDATA_CHUNK)) {
@@ -296,17 +276,17 @@ extern inline bool sm_peekdata(const void *addr, uint16_t length, const mem64_t 
                 return false;
             }
             /* go ahead with the partial read and stop the gathering process */
-            peekbuf.size += len;
+            peekbuf->size += len;
             break;
         }
         
         /* otherwise, the read worked */
-        peekbuf.size += PEEKDATA_CHUNK;
+        peekbuf->size += PEEKDATA_CHUNK;
     }
 
     /* return result to caller */
-    *result_ptr = (mem64_t*)&peekbuf.cache[reqaddr - peekbuf.base];
-    *memlength = peekbuf.base - reqaddr + peekbuf.size;
+    *result_ptr = (mem64_t*)&peekbuf->cache[reqaddr - peekbuf->base];
+    *memlength = peekbuf->base - reqaddr + peekbuf->size;
     return true;
 }
 
@@ -334,22 +314,154 @@ static inline uint16_t flags_to_memlength(scan_data_type_t scan_data_type, match
     }
 }
 
+struct sm_checkmatches_thread_shared {
+    struct attach_state_t *attach_state;
+    const uservalue_t *uservalue;
+    scan_data_type_t scan_data_type;
+    int num_threads;
+    size_t bytes_per_sample;
+    globals_t *vars;
+};
+
+struct sm_checkmatches_thread_args {
+    pthread_t thread;
+    int thread_id;
+    struct sm_checkmatches_thread_shared* shared;
+
+    /* input */
+    matches_and_old_values_array *input_matches;
+
+    /* output */
+    unsigned long num_matches;
+    matches_and_old_values_array *output_matches;
+
+    /* error */
+    char const * error_str; /* NULL if no error */
+};
+
+static void* sm_checkmatches_thread_func(void* args) {
+    struct sm_checkmatches_thread_args* thread_args = (struct sm_checkmatches_thread_args*)args;
+    
+    matches_and_old_values_swath *reading_swath_index = thread_args->input_matches->swaths;
+
+    /* create matches data structure for this thread */
+    if (!(thread_args->output_matches = allocate_array(thread_args->output_matches, thread_args->input_matches->max_needed_bytes)))
+    {
+        thread_args->error_str = "could not allocate match array";
+        return NULL;
+    }
+
+    matches_and_old_values_swath *writing_swath_index = thread_args->output_matches->swaths;
+    writing_swath_index->first_byte_in_child = NULL;
+    writing_swath_index->number_of_bytes = 0;
+
+    struct peekbuf_t peekbuf;
+    memset(&peekbuf, 0, sizeof(peekbuf));
+
+    size_t swath_index = 0;
+    size_t bytes_scanned_until_dot = 0;
+    bool stop_flag = false;
+
+    while (reading_swath_index->number_of_bytes > 0) {
+        if (swath_index % thread_args->shared->num_threads == thread_args->thread_id) {
+
+            int required_extra_bytes_to_record = 0;
+            size_t reading_iterator = 0;
+            
+            while (reading_iterator < reading_swath_index->number_of_bytes) {
+                match_flags old_flags = reading_swath_index->data[reading_iterator].match_info;
+                unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
+                void *address = reading_swath_index->first_byte_in_child + reading_iterator;
+                
+                /* read value from this address */
+                unsigned int match_length = 0;
+                const mem64_t *memory_ptr;
+                size_t memlength;
+                match_flags checkflags;
+                if (UNLIKELY(sm_peekdata(&peekbuf, address, old_length, &memory_ptr, &memlength, thread_args->shared->attach_state) == false))
+                {
+                    /* If we can't look at the data here, just abort the whole recording, something bad happened */
+                    required_extra_bytes_to_record = 0;
+                }
+                else if (old_flags != flags_empty) /* Test only valid old matches */
+                {
+                    value_t old_val = data_to_val_aux(reading_swath_index, reading_iterator, reading_swath_index->number_of_bytes);
+                    memlength = old_length < memlength ? old_length : memlength;
+
+                    checkflags = flags_empty;
+
+                    match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
+                }
+
+                if (match_length > 0)
+                {
+                    assert(match_length <= memlength);
+
+                    /* Still a candidate. Write data.
+                    - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
+                        and because we copied out the reading swath metadata already.
+                    - We can get away with assuming that the pointers will stay valid,
+                        because as we never add more data to the array than there was before, it will not reallocate. */
+
+                    writing_swath_index = add_element(&thread_args->output_matches, writing_swath_index, address,
+                                                    get_u8b(memory_ptr), checkflags);
+
+                    ++thread_args->num_matches;
+
+                    required_extra_bytes_to_record = match_length - 1;
+                }
+                else if (required_extra_bytes_to_record)
+                {
+                    writing_swath_index = add_element(&thread_args->output_matches, writing_swath_index, address,
+                                                    get_u8b(memory_ptr), flags_empty);
+                    --required_extra_bytes_to_record;
+                }
+                reading_iterator++;
+            }
+        }
+
+        /* calculate progress */
+        if (thread_args->thread_id == 0) 
+        {
+            bytes_scanned_until_dot += reading_swath_index->number_of_bytes;
+            if (bytes_scanned_until_dot >= thread_args->shared->bytes_per_sample * SAMPLES_PER_DOT) 
+            {
+                /* for user, just print a dot */
+                print_a_dot();
+
+                /* for front-end, update percentage */
+                thread_args->shared->vars->scan_progress += PROGRESS_PER_SAMPLE * SAMPLES_PER_DOT;
+                
+                bytes_scanned_until_dot = 0;
+            }
+        }
+
+        reading_swath_index = local_address_beyond_last_element(reading_swath_index);
+        swath_index++;
+
+        /* check if we are interrupted */
+        stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
+        if (stop_flag) {
+            break;
+        }
+    }
+
+    if (!(thread_args->output_matches = null_terminate(thread_args->output_matches, writing_swath_index)))
+    {
+        thread_args->error_str = "memory allocation error while reducing matches-array size";
+        return NULL;
+    }
+
+    return NULL;
+}
+
 /* This is the function that handles when you enter a value (or >, <, =) for the second or later time (i.e. when there's already a list of matches);
  * it reduces the list to those that still match. It returns false on failure to attach, detach, or reallocate memory, otherwise true. */
 bool sm_checkmatches(globals_t *vars,
                      scan_match_type_t match_type,
                      const uservalue_t *uservalue)
 {
-    matches_and_old_values_swath *reading_swath_index = vars->matches->swaths;
-    matches_and_old_values_swath reading_swath = *reading_swath_index;
-
-    unsigned long bytes_scanned = 0;
-    unsigned long total_scan_bytes = 0;
-    matches_and_old_values_swath *tmp_swath_index = reading_swath_index;
-    unsigned int samples_remaining = NUM_SAMPLES;
-    unsigned int samples_to_dot = SAMPLES_PER_DOT;
-    size_t bytes_at_next_sample;
-    size_t bytes_per_sample;
+    struct attach_state_t attach_state;
 
     if (sm_choose_scanroutine(vars->options.scan_data_type, match_type, uservalue, vars->options.reverse_endianness) == false)
     {
@@ -359,120 +471,150 @@ bool sm_checkmatches(globals_t *vars,
 
     assert(sm_scan_routine);
 
-    while(tmp_swath_index->number_of_bytes)
-    {
-        total_scan_bytes += tmp_swath_index->number_of_bytes;
-        tmp_swath_index = (matches_and_old_values_swath *)(&tmp_swath_index->data[tmp_swath_index->number_of_bytes]);
-    }
-    bytes_per_sample = total_scan_bytes / NUM_SAMPLES;
-    bytes_at_next_sample = bytes_per_sample;
-    /* for user, just print the first dot */
-    print_a_dot();
-
-    size_t reading_iterator = 0;
-    matches_and_old_values_swath *writing_swath_index = vars->matches->swaths;
-    writing_swath_index->first_byte_in_child = NULL;
-    writing_swath_index->number_of_bytes = 0;
-
-    int required_extra_bytes_to_record = 0;
-    vars->num_matches = 0;
-    vars->scan_progress = 0.0;
-    vars->stop_flag = false;
-
     /* stop and attach to the target */
-    if (sm_attach(vars->target) == false)
+    if (sm_attach(vars->target, &attach_state) == false)
+    {
         return false;
+    }
 
     INTERRUPTABLESCAN();
 
-    while (reading_swath.first_byte_in_child) {
-        unsigned int match_length = 0;
-        const mem64_t *memory_ptr;
-        size_t memlength;
-        match_flags checkflags;
+    /* reset number of matches before summing results from each thread */
+    vars->num_matches = 0;
+    vars->scan_progress = 0.0;
 
-        match_flags old_flags = reading_swath_index->data[reading_iterator].match_info;
-        unsigned int old_length = flags_to_memlength(vars->options.scan_data_type, old_flags);
-        void *address = reading_swath.first_byte_in_child + reading_iterator;
+    matches_and_old_values_swath *tmp_swath_index = vars->matches->swaths;
+    size_t number_of_swaths = 0;
+    size_t total_scan_bytes = 0;
 
-        /* read value from this address */
-        if (UNLIKELY(sm_peekdata(address, old_length, &memory_ptr, &memlength) == false))
-        {
-            /* If we can't look at the data here, just abort the whole recording, something bad happened */
-            required_extra_bytes_to_record = 0;
-        }
-        else if (old_flags != flags_empty) /* Test only valid old matches */
-        {
-            value_t old_val = data_to_val_aux(reading_swath_index, reading_iterator, reading_swath.number_of_bytes);
-            memlength = old_length < memlength ? old_length : memlength;
+    while(tmp_swath_index->number_of_bytes)
+    {
+        number_of_swaths++;
+        total_scan_bytes += tmp_swath_index->number_of_bytes;
+        tmp_swath_index = (matches_and_old_values_swath *)(&tmp_swath_index->data[tmp_swath_index->number_of_bytes]);
+    }
 
-            checkflags = flags_empty;
+    /* get number of threads to use */
+    int num_threads;
+    if (vars->options.num_parallel_jobs == 0) 
+    {
+        /* query os for number of cores */
+        num_threads = get_nprocs();
+    }
+    else 
+    {
+        num_threads = vars->options.num_parallel_jobs;
+    }
 
-            match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, uservalue, &checkflags);
-        }
+    /* if number_of_swaths is less than threads, reduce number of threads */
+    if (number_of_swaths < num_threads) 
+    {
+        num_threads = number_of_swaths;
+    }
 
-        if (match_length > 0)
-        {
-            assert(match_length <= memlength);
+    /* create threads */
+    struct sm_checkmatches_thread_args* thread_args;
 
-            /* Still a candidate. Write data.
-               - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
-                 and because we copied out the reading swath metadata already.
-               - We can get away with assuming that the pointers will stay valid,
-                 because as we never add more data to the array than there was before, it will not reallocate. */
+    thread_args = malloc(num_threads * sizeof(struct sm_checkmatches_thread_args));
+    if (thread_args == NULL) 
+    {
+        show_error("could not allocate kernel_args array\n");
+        return false;
+    }
+    memset(thread_args, 0, num_threads * sizeof(struct sm_checkmatches_thread_args));
 
-            writing_swath_index = add_element(&(vars->matches), writing_swath_index, address,
-                                              get_u8b(memory_ptr), checkflags);
+    struct sm_checkmatches_thread_shared shared;
+    memset(&shared, 0, sizeof(shared));
+    shared.num_threads = num_threads;
+    shared.attach_state = &attach_state;
+    shared.uservalue = uservalue;
+    shared.scan_data_type = vars->options.scan_data_type;
+    shared.bytes_per_sample = total_scan_bytes / NUM_SAMPLES;
+    shared.vars = vars;
 
-            ++vars->num_matches;
+    for (int thread_id = 0; thread_id < num_threads; thread_id++) 
+    {
+        thread_args[thread_id].thread_id = thread_id;
+        thread_args[thread_id].shared = &shared;
 
-            required_extra_bytes_to_record = match_length - 1;
-        }
-        else if (required_extra_bytes_to_record)
-        {
-            writing_swath_index = add_element(&(vars->matches), writing_swath_index, address,
-                                              get_u8b(memory_ptr), flags_empty);
-            --required_extra_bytes_to_record;
-        }
-
-        if (UNLIKELY(bytes_scanned >= bytes_at_next_sample)) {
-            bytes_at_next_sample += bytes_per_sample;
-            /* handle rounding */
-            if (LIKELY(--samples_remaining > 0)) {
-                /* for front-end, update percentage */
-                vars->scan_progress += PROGRESS_PER_SAMPLE;
-                if (UNLIKELY(--samples_to_dot == 0)) {
-                    samples_to_dot = SAMPLES_PER_DOT;
-                    /* for user, just print a dot */
-                    print_a_dot();
-                }
-                /* stop scanning if asked to */
-                if (vars->stop_flag) {
-                    printf("\n");
-                    break;
-                }
-            }
-        }
-        ++bytes_scanned;
-        
-        /* go on to the next one... */
-        ++reading_iterator;
-        if (reading_iterator >= reading_swath.number_of_bytes)
-        {
-            reading_swath_index = (matches_and_old_values_swath *)
-                (&reading_swath_index->data[reading_swath.number_of_bytes]);
-            reading_swath = *reading_swath_index;
-            reading_iterator = 0;
-            required_extra_bytes_to_record = 0; /* just in case */
+        thread_args[thread_id].input_matches = vars->matches;
+        thread_args[thread_id].num_matches = 0;
+        thread_args[thread_id].output_matches = NULL;
+        thread_args[thread_id].error_str = NULL;
+    
+        int ret = pthread_create(&thread_args[thread_id].thread, NULL, sm_checkmatches_thread_func, (void*)&thread_args[thread_id]);
+        if (ret) {
+            show_error("could not create thread %d\n", thread_id);
+            return false;
         }
     }
 
+
+    /* allocate new master swath array to store results, 
+       of same size as current master swath array 
+    */
+    matches_and_old_values_array *new_matches = NULL;
+    if (!(new_matches = allocate_array(new_matches, vars->matches->max_needed_bytes)))
+    {
+        show_error("could not allocate match array\n");
+        return false;
+    }
+    matches_and_old_values_swath *writing_swath_index;
+    writing_swath_index = new_matches->swaths;
+    writing_swath_index->first_byte_in_child = NULL;
+    writing_swath_index->number_of_bytes = 0;
+
+    /* join threads, sum up matches and merge matches */
+    bool error = false;
+    for (int i = 0; i < num_threads; i++) 
+    {
+        int ret = pthread_join(thread_args[i].thread, NULL);
+        if (ret) 
+        {
+            show_error("could not join thread %d\n", i);
+            return false;
+        }
+
+        /* check if thread failed */
+        if (thread_args[i].error_str != NULL) 
+        {
+            show_error("thread %d hit error: %s\n", i, thread_args[i].error_str);
+            error = true;
+            continue;
+        }
+        
+        /* sum up matches */
+        vars->num_matches += thread_args[i].num_matches;
+
+        /* merge matches */
+        writing_swath_index = concat_array(&new_matches, writing_swath_index, thread_args[i].output_matches);
+        free(thread_args[i].output_matches);
+    }
+
+    free(vars->matches);
+    vars->matches = new_matches;
+    
+    /* store if we were interrupted */
+    bool interrupted_scan = atomic_load(&vars->stop_flag); 
+
     ENDINTERRUPTABLE();
 
+    /* if any thread failed */
+    if (error) 
+    {
+        return false;
+    }
+
+    /* null terminate matches */
     if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
     {
         show_error("memory allocation error while reducing matches-array size\n");
         return false;
+    }
+
+    if (interrupted_scan) 
+    {
+        show_info("interrupted scan\n");
     }
 
     show_user("ok\n");
@@ -483,22 +625,191 @@ bool sm_checkmatches(globals_t *vars,
     show_info("we currently have %ld matches.\n", vars->num_matches);
 
     /* okay, detach */
-    return sm_detach(vars->target);
+    return sm_detach(vars->target, &attach_state);
 }
 
+struct sm_searchregions_thread_shared {
+    int num_threads;
+    size_t search_stride;           /* how many bytes to search at a time (for each thread) */
+    size_t max_read_size;           /* how many bytes to read at a time (for each thread), should be search_stride + max_vlt_size */
+    size_t total_matches_size;      /* total size of matches array */
+    struct attach_state_t *attach_state;
+    const uservalue_t *uservalue;
+    size_t total_scan_bytes;
+    globals_t *vars;
+};
+
+struct sm_searchregions_thread_args {
+    pthread_t thread;
+    int thread_id;
+    struct sm_searchregions_thread_shared* shared;
+    
+    /* input (head of regions to search) */
+    element_t const *head;
+
+    /* output */
+    unsigned long num_matches;
+    matches_and_old_values_array *matches;
+    matches_and_old_values_swath *writing_swath_index;
+
+    /* error */
+    char const * error_str; /* NULL if no error */
+};
+
+static void* sm_searchregions_thread_func(void* args) {
+    struct sm_searchregions_thread_args* thread_args = (struct sm_searchregions_thread_args*)args;
+
+    /* create matches data structure for this thread */
+    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size)))
+    {
+        thread_args->error_str = "could not allocate match array\n";
+        return NULL;
+    }
+    
+    thread_args->writing_swath_index = thread_args->matches->swaths; 
+    thread_args->writing_swath_index->first_byte_in_child = NULL;
+    thread_args->writing_swath_index->number_of_bytes = 0;
+
+    element_t const *n = thread_args->head;
+    size_t regnum = 0;
+    bool stop_flag = false;
+
+    while (n) 
+    {
+        region_t const *r = (region_t const *)n->data;
+        unsigned char *data = NULL;
+
+        size_t bytes_per_sample = r->size / NUM_SAMPLES;
+        size_t bytes_scanned_until_dot = 0;
+        
+        /* allocate data array */
+        size_t alloc_size = MIN(r->size, thread_args->shared->max_read_size);
+        if ((data = malloc(alloc_size * sizeof(char))) == NULL) 
+        {
+            thread_args->error_str = "sorry, there was a memory allocation error.\n";
+            return NULL;
+        }
+
+        /* print a progress meter so user knows we haven't crashed */
+        if (thread_args->thread_id == 0)
+        {
+            show_user("%02lu/%02lu searching %#10lx - %#10lx", ++regnum,
+                    thread_args->shared->vars->regions->size, (unsigned long)r->start, (unsigned long)r->start + r->size);
+            fflush(stderr);
+        }
+
+        /* For every offset, check if we have a match. */
+        for (size_t offset = (size_t)thread_args->thread_id * thread_args->shared->search_stride; offset < r->size; offset += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads) 
+        {
+            void *reg_pos = r->start + offset;
+
+            /* load the next buffer block */
+            size_t read_size = MIN(r->size - offset, thread_args->shared->max_read_size);
+            size_t nread = sm_readmemory(data, reg_pos, read_size, thread_args->shared->attach_state);
+            /* check if the read succeeded */
+            if ((nread == 0) && (offset == 0)) 
+            {
+                /* Failed on first read, which means region not exist. */
+                show_warn("reading region %02u failed.\n", r->start);
+                break;
+            }
+
+            int required_extra_bytes_to_record = 0;
+
+            /* search for matches */
+            size_t search_area = MIN(nread, thread_args->shared->search_stride);
+            for (size_t i = 0; i < search_area; i++) 
+            {
+                const mem64_t* memory_ptr = (mem64_t*)(data + i);
+                unsigned int match_length;
+                match_flags checkflags;
+
+                /* initialize checkflags */
+                checkflags = flags_empty;
+                
+                /* check if we have a match */
+                match_length = (*sm_scan_routine)(memory_ptr, search_area - i, NULL, thread_args->shared->uservalue, &checkflags);
+                
+                if (UNLIKELY(match_length > 0))
+                {
+                    assert(match_length <= nread);
+                    thread_args->writing_swath_index = add_element(&thread_args->matches, thread_args->writing_swath_index, reg_pos + i,
+                                                    get_u8b(memory_ptr), checkflags);
+                    
+                    thread_args->num_matches++;
+                    
+                    required_extra_bytes_to_record = match_length - 1;
+                }
+                else if (required_extra_bytes_to_record)
+                {
+                    thread_args->writing_swath_index = add_element(&thread_args->matches, thread_args->writing_swath_index, reg_pos + i,
+                                                    get_u8b(memory_ptr), flags_empty);
+                    --required_extra_bytes_to_record;
+                }
+                
+            }
+
+            /* calculate progress */
+            if (thread_args->thread_id == 0) 
+            {
+                bytes_scanned_until_dot += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads; /* approximation */
+                if (bytes_scanned_until_dot >= bytes_per_sample * SAMPLES_PER_DOT) 
+                {
+                    /* for user, just print a dot */
+                    print_a_dot();
+                    
+                    /* for front-end, update percentage */
+                    size_t bytes_per_dot = r->size / NUM_DOTS;
+                    double progress_per_dot = (double)bytes_per_dot / thread_args->shared->total_scan_bytes;
+                    thread_args->shared->vars->scan_progress += progress_per_dot;
+
+                    bytes_scanned_until_dot = 0;
+                }
+            }
+
+            /* check if we are interrupted */
+            stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
+            if (stop_flag) 
+            {
+                break;
+            }
+        }
+        
+        free(data);
+
+        n = n->next;
+
+        /* check if we are interrupted */
+        if (stop_flag) 
+        {
+            break;
+        }
+
+        if (thread_args->thread_id == 0) 
+        {
+            show_user("ok\n");
+        }  
+    }
+
+    if (!(thread_args->matches = null_terminate(thread_args->matches, thread_args->writing_swath_index)))
+    {
+        thread_args->error_str = "memory allocation error while reducing matches-array size\n";
+        return NULL;
+    }
+
+    return NULL;
+}
 
 /* sm_searchregions() performs an initial search of the process for values matching `uservalue` */
 bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const uservalue_t *uservalue)
 {
-    matches_and_old_values_swath *writing_swath_index;
-    int required_extra_bytes_to_record = 0;
-    unsigned long total_size = 0;
-    unsigned long regnum = 0;
-    element_t *n = vars->regions->head;
-    region_t *r;
-    unsigned long total_scan_bytes = 0;
-    unsigned char *data = NULL;
+    struct attach_state_t attach_state;
 
+    size_t total_matches_size = 0;
+    size_t total_scan_bytes = 0;
+    element_t const *n = vars->regions->head;    
+
+    /* select scanroutine */
     if (sm_choose_scanroutine(vars->options.scan_data_type, match_type, uservalue, vars->options.reverse_endianness) == false)
     {
         show_error("unsupported scan for current data type.\n"); 
@@ -508,40 +819,32 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     assert(sm_scan_routine);
 
     /* stop and attach to the target */
-    if (sm_attach(vars->target) == false)
+    if (sm_attach(vars->target, &attach_state) == false) 
+    {
         return false;
-
+    }
    
     /* make sure we have some regions to search */
-    if (vars->regions->size == 0) {
+    if (vars->regions->size == 0) 
+    {
         show_warn("no regions defined, perhaps you deleted them all?\n");
         show_info("use the \"reset\" command to refresh regions.\n");
-        return sm_detach(vars->target);
+        return sm_detach(vars->target, &attach_state);
     }
 
     INTERRUPTABLESCAN();
-    
-    total_size = sizeof(matches_and_old_values_array);
 
-    while (n) {
-        total_size += ((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath);
+    total_matches_size = sizeof(matches_and_old_values_array);
+
+    while (n) 
+    {
+        total_matches_size += ((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath);
         n = n->next;
     }
     
-    total_size += sizeof(matches_and_old_values_swath); /* for null terminate */
+    total_matches_size += sizeof(matches_and_old_values_swath); /* for null terminate */
     
-    show_debug("allocate array, max size %ld\n", total_size);
-
-    if (!(vars->matches = allocate_array(vars->matches, total_size)))
-    {
-        show_error("could not allocate match array\n");
-        return false;
-    }
-    
-    writing_swath_index = vars->matches->swaths;
-    
-    writing_swath_index->first_byte_in_child = NULL;
-    writing_swath_index->number_of_bytes = 0;
+    show_debug("allocate array, max size %ld\n", total_matches_size);
     
     /* get total number of bytes */
     for(n = vars->regions->head; n; n = n->next)
@@ -551,149 +854,167 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     vars->stop_flag = false;
     n = vars->regions->head;
 
-    /* check every memory region */
-    while (n) {
-        size_t bytes_remaining;
-        size_t bytes_per_dot;
-        double progress_per_dot;
-
-        /* load the next region */
-        r = n->data;
-        bytes_per_dot = r->size / NUM_DOTS;
-        bytes_remaining = bytes_per_dot * NUM_DOTS;
-        progress_per_dot = (double)bytes_per_dot / total_scan_bytes;
-
-/* The maximum logical size is a comfortable 1MiB (increasing it does not help).
- * The actual allocation is that plus the rounded size of the maximum possible VLT.
- * This is needed because the last byte might be scanned as max size VLT,
- * thus need (2^16 - 2) extra bytes after it */
+    /* The maximum logical size is a comfortable 1MiB (increasing it does not help).
+     * The actual allocation is that plus the rounded size of the maximum possible VLT.
+     * This is needed because the last byte might be scanned as max size VLT,
+     * thus need (2^16 - 2) extra bytes after it */
 #define MAX_BUFFER_SIZE (1<<20)
 #define MAX_ALLOC_SIZE  (MAX_BUFFER_SIZE + (1<<16))
+    
+    /* divide up work for each thread,
+       each thread will read a chunk of memory of size max_read_size (or less if near end of region),
+       however match searches will only start from offsets 0 to search_stride */
+    size_t search_stride = MAX_BUFFER_SIZE;
+    size_t max_read_size = MAX_ALLOC_SIZE;
 
-        /* allocate data array */
-        size_t alloc_size = MIN(r->size, MAX_ALLOC_SIZE);
-        if ((data = malloc(alloc_size * sizeof(char))) == NULL) {
-            show_error("sorry, there was a memory allocation error.\n");
+    /* get number of threads to use */
+    int num_threads;
+    if (vars->options.num_parallel_jobs == 0) 
+    {
+        /* query os for number of cores */
+        num_threads = get_nprocs();
+    }
+    else 
+    {
+        num_threads = vars->options.num_parallel_jobs;
+    }
+
+    /* if total bytes to read is less than num_threads * search_stride, reduce number of threads */
+    if (total_scan_bytes < num_threads * search_stride) 
+    {
+        num_threads = total_scan_bytes / search_stride;
+    }
+
+    /* create threads */
+    struct sm_searchregions_thread_args* thread_args;
+
+    thread_args = malloc(num_threads * sizeof(struct sm_searchregions_thread_args));
+    if (thread_args == NULL) 
+    {
+        show_error("could not allocate kernel_args array\n");
+        return false;
+    }
+    memset(thread_args, 0, num_threads * sizeof(struct sm_searchregions_thread_args));
+
+    struct sm_searchregions_thread_shared shared;
+    memset(&shared, 0, sizeof(shared));
+    shared.num_threads = num_threads;
+    shared.search_stride = search_stride;
+    shared.max_read_size = max_read_size;
+    shared.total_matches_size = total_matches_size;
+    shared.attach_state = &attach_state;
+    shared.uservalue = uservalue;
+    shared.total_scan_bytes = total_scan_bytes;
+    shared.vars = vars;
+
+    for (int thread_id = 0; thread_id < num_threads; thread_id++) 
+    {
+        thread_args[thread_id].thread_id = thread_id;
+        thread_args[thread_id].shared = &shared;
+
+        thread_args[thread_id].head = n;
+        thread_args[thread_id].num_matches = 0;
+        thread_args[thread_id].matches = NULL;
+        thread_args[thread_id].writing_swath_index = NULL;
+        thread_args[thread_id].error_str = NULL;
+    
+        int ret = pthread_create(&thread_args[thread_id].thread, NULL, sm_searchregions_thread_func, (void*)&thread_args[thread_id]);
+        if (ret) 
+        {
+            show_error("could not create thread %d\n", thread_id);
+            return false;
+        }
+    }
+    
+    /* allocate master swath array */
+    if (!(vars->matches = allocate_array(vars->matches, total_matches_size * num_threads)))
+    {
+        show_error("could not allocate match array\n");
+        return false;
+    }
+    matches_and_old_values_swath *writing_swath_index;
+    writing_swath_index = vars->matches->swaths;
+    writing_swath_index->first_byte_in_child = NULL;
+    writing_swath_index->number_of_bytes = 0;
+
+    /* reset number of matches before summing results from each thread */
+    vars->num_matches = 0;
+
+    /* join threads, sum up matches and merge matches */
+    bool error = false;
+    for (int i = 0; i < num_threads; i++) 
+    {
+        int ret = pthread_join(thread_args[i].thread, NULL);
+        if (ret) {
+            show_error("could not join thread %d\n", i);
             return false;
         }
 
-        /* print a progress meter so user knows we haven't crashed */
-        show_user("%02lu/%02lu searching %#10lx - %#10lx", ++regnum,
-                vars->regions->size, (unsigned long)r->start, (unsigned long)r->start + r->size);
-        fflush(stderr);
-
-        /* For every offset, check if we have a match. */
-        size_t memlength = r->size;
-        size_t buffer_size = 0;
-        void *reg_pos = r->start;
-        const uint8_t *buf_pos = NULL;
-        for ( ; ; memlength--, buffer_size--, reg_pos++, buf_pos++) {
-
-            /* check if the buffer is finished (or we just started) */
-            if (UNLIKELY(buffer_size == 0)) {
-
-                /* print a simple progress meter */
-                for ( ; memlength < bytes_remaining; bytes_remaining -= bytes_per_dot) {
-                    /* for user, just print a dot */
-                    print_a_dot();
-                    /* for front-end, update percentage */
-                    vars->scan_progress += progress_per_dot;
-                }
-
-                /* the whole region is finished */
-                if (memlength == 0) break;
-
-                /* stop scanning if asked to */
-                if (vars->stop_flag) break;
-
-                /* load the next buffer block */
-                size_t read_size = MIN(memlength, MAX_ALLOC_SIZE);
-                size_t nread = readmemory(data, reg_pos, read_size);
-                if (nread < read_size) {
-                    /* the region ends here, update `memlength` */
-                    memlength = nread;
-                    if ((nread == 0) && (reg_pos == r->start)) {
-                        /* Failed on first read, which means region not exist. */
-                        show_warn("reading region %02u failed.\n", regnum);
-                        break;
-                    }
-                }
-                /* If less than `MAX_ALLOC_SIZE` bytes remain, we have all of them
-                 * in the buffer, so go all the way.
-                 * Otherwise we need to stop at `MAX_BUFFER_SIZE`, so that
-                 * the last byte we look at has a full VLT after it */
-                buffer_size = memlength <= MAX_ALLOC_SIZE ? memlength : MAX_BUFFER_SIZE;
-                buf_pos = data;
-            }
-
-            const mem64_t* memory_ptr = (mem64_t*)buf_pos;
-            unsigned int match_length;
-            match_flags checkflags;
-
-            /* initialize checkflags */
-            checkflags = flags_empty;
-
-            /* check if we have a match */
-            match_length = (*sm_scan_routine)(memory_ptr, memlength, NULL, uservalue, &checkflags);
-            if (UNLIKELY(match_length > 0))
-            {
-                assert(match_length <= memlength);
-                writing_swath_index = add_element(&(vars->matches), writing_swath_index, reg_pos,
-                                                  get_u8b(memory_ptr), checkflags);
-                
-                ++vars->num_matches;
-                
-                required_extra_bytes_to_record = match_length - 1;
-            }
-            else if (required_extra_bytes_to_record)
-            {
-                writing_swath_index = add_element(&(vars->matches), writing_swath_index, reg_pos,
-                                                  get_u8b(memory_ptr), flags_empty);
-                --required_extra_bytes_to_record;
-            }
-
+        /* check if thread hit error */
+        if (thread_args[i].error_str != NULL) 
+        {
+            show_error("thread %d hit error: %s\n", i, thread_args[i].error_str);
+            error = true;
+            continue;
         }
+        
+        /* sum up matches */
+        vars->num_matches += thread_args[i].num_matches;
 
-        free(data);
-
-        /* stop scanning if asked to */
-        if (vars->stop_flag) {
-            printf("\n");
-            break;
-        }
-        n = n->next;
-        show_user("ok\n");
+        /* merge matches */
+        writing_swath_index = concat_array(&vars->matches, writing_swath_index, thread_args[i].matches);
+        free(thread_args[i].matches);
     }
+
+    /* store if we were interrupted */
+    bool interrupted_scan = atomic_load(&vars->stop_flag);
 
     ENDINTERRUPTABLE();
 
-    /* tell front-end we've finished */
-    vars->scan_progress = MAX_PROGRESS;
-    
+    if (error) 
+    {
+        return false;
+    }
+
+    /* null terminate matches */
     if (!(vars->matches = null_terminate(vars->matches, writing_swath_index)))
     {
         show_error("memory allocation error while reducing matches-array size\n");
         return false;
     }
+    
+    free(thread_args);
+
+    if (interrupted_scan) 
+    {
+        show_info("interrupted scan\n");
+    }
+
+    /* tell front-end we've finished */
+    vars->scan_progress = MAX_PROGRESS;
 
     show_info("we currently have %ld matches.\n", vars->num_matches);
 
     /* okay, detach */
-    return sm_detach(vars->target);
+    return sm_detach(vars->target, &attach_state);
 }
 
 /* Needs to support only ANYNUMBER types */
 bool sm_setaddr(pid_t target, void *addr, const value_t *to)
 {
+    struct attach_state_t attach_state;
+
     unsigned int i;
     uint8_t memarray[sizeof(uint64_t)] = {0};
     size_t memlength;
 
-    if (sm_attach(target) == false) {
+    /* stop and attach to the target */
+    if (sm_attach(target, &attach_state) == false)
+    {
         return false;
     }
 
-    memlength = readmemory(memarray, addr, sizeof(uint64_t));
+    memlength = sm_readmemory(memarray, addr, sizeof(uint64_t), &attach_state);
     if (memlength == 0) {
         show_error("couldn't access the target address %10p\n", addr);
         return false;
@@ -712,7 +1033,7 @@ bool sm_setaddr(pid_t target, void *addr, const value_t *to)
     if (sm_globals.options.no_ptrace)
     {
 #if HAVE_PROCMEM
-        if (pwrite(peekbuf.procmem_fd, memarray, sizeof(uint64_t), (long)addr) == -1)
+        if (pwrite(attach_state.procmem_fd, memarray, sizeof(uint64_t), (long)addr) == -1)
         {
             return false;
         }
@@ -731,39 +1052,47 @@ bool sm_setaddr(pid_t target, void *addr, const value_t *to)
         }
     }
 
-    return sm_detach(target);
+    return sm_detach(target, &attach_state);
 }
 
 bool sm_read_array(pid_t target, const void *addr, void *buf, size_t len)
 {
-    if (sm_attach(target) == false) {
+    struct attach_state_t attach_state;
+
+    /* stop and attach to the target */
+    if (sm_attach(target, &attach_state) == false)
+    {
         return false;
     }
 
-    size_t nread = readmemory(buf, addr, len);
+    size_t nread = sm_readmemory(buf, addr, len, &attach_state);
     if (nread < len)
     {
-        sm_detach(target);
+        sm_detach(target, &attach_state);
         return false;
     }
 
-    return sm_detach(target);
+    return sm_detach(target, &attach_state);
 }
 
 /* TODO: may use /proc/<pid>/mem here */
 bool sm_write_array(pid_t target, void *addr, const void *data, size_t len)
 {
+    struct attach_state_t attach_state;
+
     unsigned int i,j;
     long peek_value;
 
-    if (sm_attach(target) == false) {
+    /* stop and attach to the target */
+    if (sm_attach(target, &attach_state) == false)
+    {
         return false;
     }
 
     if (sm_globals.options.no_ptrace)
     {
 #if HAVE_PROCMEM
-        if (pwrite(peekbuf.procmem_fd, data, len, (long)addr) == -1)
+        if (pwrite(attach_state.procmem_fd, data, len, (long)addr) == -1)
         {
             return false;
         }
@@ -822,5 +1151,5 @@ bool sm_write_array(pid_t target, void *addr, const void *data, size_t len)
         }
     }
 
-    return sm_detach(target);
+    return sm_detach(target, &attach_state);
 }

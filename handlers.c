@@ -183,11 +183,10 @@ bool handler__set(globals_t * vars, char **argv, unsigned argc)
 
     /* --- setup a longjmp to handle interrupt --- */
     if (INTERRUPTABLE()) {
-        
         /* control returns here when interrupted */
 // settings is allocated with alloca, do not free it
 //        free(settings);
-        sm_detach(vars->target);
+        sm_detach(vars->target, NULL);
         ENDINTERRUPTABLE();
         return true;
     }
@@ -760,12 +759,7 @@ bool handler__operators(globals_t * vars, char **argv, unsigned argc)
             show_error("there are currently no matches.\n");
             return false;
         }
-#if SCANMEM_MULTI_THREADING == 1
-        show_info("multi-threaded enabled\n");
-        if (sm_multi_checkmatches(vars, m, &val) == false) {
-#else
         if (sm_checkmatches(vars, m, &val) == false) {
-#endif
             show_error("failed to search target address space.\n");
             return false;
         }
@@ -787,12 +781,7 @@ bool handler__operators(globals_t * vars, char **argv, unsigned argc)
         }
         else
         {
-#if SCANMEM_MULTI_THREADING == 1
-            show_info("multi-threaded enabled\n");
-            if (sm_multi_searchregions(vars, m, &val) != true) {
-#else
             if (sm_searchregions(vars, m, &val) != true) {
-#endif
                 show_error("failed to search target address space.\n");
                 return false;
             }
@@ -1206,8 +1195,12 @@ bool handler__watch(globals_t * vars, char **argv, unsigned argc)
     
     val = data_to_val(loc.swath, loc.index);
 
+    struct attach_state_t attach_state;
+    struct peekbuf_t peekbuf;
+    memset(&peekbuf, 0, sizeof(peekbuf));
+
     if (INTERRUPTABLE()) {
-        (void) sm_detach(vars->target);
+        (void) sm_detach(vars->target, &attach_state);
         ENDINTERRUPTABLE();
         return true;
     }
@@ -1223,10 +1216,10 @@ bool handler__watch(globals_t * vars, char **argv, unsigned argc)
         const mem64_t *memory_ptr;
         size_t memlength;
 
-        if (sm_attach(vars->target) == false)
+        if (sm_attach(vars->target, &attach_state) == false)
             return false;
 
-        if (sm_peekdata(address, sizeof(uint64_t), &memory_ptr, &memlength) == false)
+        if (sm_peekdata(&peekbuf, address, sizeof(uint64_t), &memory_ptr, &memlength, &attach_state) == false)
             return false;
 
         /* check if the new value is different */
@@ -1245,7 +1238,7 @@ bool handler__watch(globals_t * vars, char **argv, unsigned argc)
         }
 
         /* detach after valuecmp_routine, since it may read more data (e.g. bytearray) */
-        sm_detach(vars->target);
+        sm_detach(vars->target, &attach_state);
 
         (void) sleep(1);
     }
