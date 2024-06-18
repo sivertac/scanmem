@@ -314,6 +314,18 @@ static inline uint16_t flags_to_memlength(scan_data_type_t scan_data_type, match
     }
 }
 
+static int get_number_of_threads(int num_parallel_jobs) {
+    if (num_parallel_jobs == 0) 
+    {
+        /* query os for number of cores */
+        return get_nprocs();
+    }
+    else 
+    {
+        return num_parallel_jobs;
+    }
+}
+
 struct sm_checkmatches_thread_shared {
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
@@ -495,16 +507,7 @@ bool sm_checkmatches(globals_t *vars,
     }
 
     /* get number of threads to use */
-    int num_threads;
-    if (vars->options.num_parallel_jobs == 0) 
-    {
-        /* query os for number of cores */
-        num_threads = get_nprocs();
-    }
-    else 
-    {
-        num_threads = vars->options.num_parallel_jobs;
-    }
+    int num_threads = get_number_of_threads(vars->options.num_parallel_jobs);
 
     /* if number_of_swaths is less than threads, reduce number of threads */
     if (number_of_swaths < num_threads) 
@@ -870,16 +873,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     size_t max_read_size = MAX_ALLOC_SIZE;
 
     /* get number of threads to use */
-    int num_threads;
-    if (vars->options.num_parallel_jobs == 0) 
-    {
-        /* query os for number of cores */
-        num_threads = get_nprocs();
-    }
-    else 
-    {
-        num_threads = vars->options.num_parallel_jobs;
-    }
+    int num_threads = get_number_of_threads(vars->options.num_parallel_jobs);
 
     /* if total bytes to read is less than num_threads * search_stride, reduce number of threads */
     if (total_scan_bytes < num_threads * search_stride) 
