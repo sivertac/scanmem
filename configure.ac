@@ -59,43 +59,62 @@ case "$host_os" in
     ;;
 esac
 
-# Allows disabling procmem support
+# Allows disabling process_vm_readv support.
+AC_ARG_ENABLE(process_vm_readv, [AS_HELP_STRING([--disable-process-vm-readv],
+                         [forcefully disable process_vm_readv support])])
+
+# Check for process_vm_readv support.
+AS_IF([test "x$enable_process_vm_readv" != "xno"], [
+  AC_CHECK_FUNC(process_vm_readv)
+  AS_IF([test "x$ac_cv_func_process_vm_readv" = "xno"],[
+    AC_DEFINE(HAVE_PROCESS_VM_READV, [0], [Enable process_vm_readv support])
+  ],[
+    AC_DEFINE(HAVE_PROCESS_VM_READV, [1], [Enable process_vm_readv support])
+  ])
+])
+
+# Allows disabling procmem support.
 AC_ARG_ENABLE(procmem, [AS_HELP_STRING([--disable-procmem],
                          [forcefully disable proc/pid/mem support])])
+
 AS_IF([test "x$enable_procmem" = "xno"], [
   AC_DEFINE(HAVE_PROCMEM, [0], [Enable /proc/pid/mem support])
 ])
 
-AS_IF([test "x$android" = "xno"], [
-  AS_IF([test "x$enable_procmem" != "xno"], [
-    # also need to check if the file is zero'ed (some hardened systems)
-    AC_CHECK_FILE([/proc/self/maps], [], [
-      echo "This system does not seem to have /proc/pid/maps files."
-      exit 1
-    ])
+AS_IF([test "x$enable_process_vm_readv" = "xno" || test "x$ac_cv_func_process_vm_readv" = "xno"], [
+  AS_IF([test "x$android" = "xno"], [
+    AS_IF([test "x$enable_procmem" != "xno"], [
+      # also need to check if the file is zero'ed (some hardened systems)
+      AC_CHECK_FILE([/proc/self/maps], [], [
+        echo "This system does not seem to have /proc/pid/maps files."
+        exit 1
+      ])
 
-    # also need to check this file works
-    AC_CHECK_FILE([/proc/self/mem], [
-      # LARGEFILE support required for this to work
-      AC_SYS_LARGEFILE
-      AC_DEFINE(HAVE_PROCMEM, [1], [Enable /proc/pid/mem support])
-    ],[
-      # This will hurt performance.
-      echo "This system does not seem to have /proc/pid/mem files."
-      echo "Falling back to ptrace() only support."
-      AC_DEFINE(HAVE_PROCMEM, [0], [Enable /proc/pid/mem support])
+      # also need to check this file works
+      AC_CHECK_FILE([/proc/self/mem], [
+        # LARGEFILE support required for this to work
+        AC_SYS_LARGEFILE
+        AC_DEFINE(HAVE_PROCMEM, [1], [Enable /proc/pid/mem support])
+      ],[
+        # This will hurt performance.
+        echo "This system does not seem to have /proc/pid/mem files."
+        echo "Falling back to ptrace() only support."
+        AC_DEFINE(HAVE_PROCMEM, [0], [Enable /proc/pid/mem support])
+      ])
     ])
+  ], [
+    # supported on Android
+    AC_SYS_LARGEFILE
+    # /proc/pid/mem is there but reading interesting data fails
+    AC_DEFINE(HAVE_PROCMEM, [0], [Enable /proc/pid/mem support])
   ])
-    # malloc optimizations without Android
-    AC_FUNC_MALLOC
-    AC_FUNC_REALLOC
-], [
-  # supported on Android
-  AC_SYS_LARGEFILE
-  # /proc/pid/mem is there but reading interesting data fails
-  AC_DEFINE(HAVE_PROCMEM, [0], [Enable /proc/pid/mem support])
 ])
 
+AS_IF([test "x$android" = "xno"], [
+  # malloc optimizations without Android
+  AC_FUNC_MALLOC
+  AC_FUNC_REALLOC
+])
 
 # Check for termcap and readline or bypass checking for the libraries.
 AC_ARG_WITH([readline], [AS_HELP_STRING([--without-readline],

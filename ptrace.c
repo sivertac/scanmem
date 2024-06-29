@@ -51,6 +51,10 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+#if HAVE_PROCESS_VM_READV
+#include <sys/uio.h>
+#endif
+
 // dirty hack for FreeBSD
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
 #define PTRACE_ATTACH PT_ATTACH
@@ -150,10 +154,22 @@ static inline size_t sm_readmemory(uint8_t *dest_buffer, const char *target_addr
 {
     size_t nread = 0;
 
-#if HAVE_PROCMEM
+#if HAVE_PROCMEM || HAVE_PROCESS_VM_READV
     do {
+#if HAVE_PROCMEM
         ssize_t ret = pread(attach_state->procmem_fd, dest_buffer + nread,
                             size - nread, (unsigned long)(target_address + nread));
+#elif HAVE_PROCESS_VM_READV
+        struct iovec local[1];
+        struct iovec remote[1];
+
+        local[0].iov_base = dest_buffer + nread;
+        local[0].iov_len = size - nread;
+        remote[0].iov_base = target_address + nread;
+        remote[0].iov_len = size - nread;
+
+        ssize_t ret = process_vm_readv(attach_state->pid, local, 1, remote, 1, 0);
+#endif
         if (ret == -1) {
             /* we can't read further, report what was read */
             return nread;
