@@ -342,6 +342,8 @@ static int get_number_of_threads(int num_parallel_jobs) {
     }
 }
 
+#define ORDERED_MATCHES 1
+
 struct sm_checkmatches_thread_shared {
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
@@ -656,7 +658,10 @@ struct sm_searchregions_thread_shared {
     size_t total_matches_size;      /* total size of matches array */
     struct attach_state_t *attach_state;
     const uservalue_t *uservalue;
-    size_t total_scan_bytes;
+    size_t total_scan_bytes;        /* total number of bytes to scan */
+#if ORDERED_MATCHES
+    size_t total_scan_blocks;       /* total number of blocks to scan, calculated as `size of each regian in bytes / search stride` rounded up to multiple of search stride, then summed together */
+#endif
     globals_t *vars;
 };
 
@@ -695,6 +700,16 @@ static void* sm_searchregions_thread_func(void* args) {
     size_t regnum = 0;
     bool stop_flag = false;
 
+#if ORDERED_MATCHES
+    size_t blocks_to_scan = thread_args->shared->total_scan_blocks / thread_args->shared->num_threads;
+    const size_t block_start = blocks_to_scan * thread_args->thread_id;
+    /* if this is the last thread, make sure all blocks at the end are covered */
+    if (thread_args->thread_id == thread_args->shared->num_threads - 1) {
+        blocks_to_scan = thread_args->shared->total_scan_blocks - block_start;
+    }
+    size_t block_current = 0;
+#endif
+
     while (n) 
     {
         region_t const *r = (region_t const *)n->data;
@@ -720,8 +735,20 @@ static void* sm_searchregions_thread_func(void* args) {
         }
 
         /* For every offset, check if we have a match. */
+#if ORDERED_MATCHES
+        size_t offset = 0;
+        while (block_current < block_start + blocks_to_scan && offset < r->size) {
+            /* check if current block is relevant for this thread, if not go to next */
+            if (block_current < block_start) {
+                ++block_current;
+                offset += thread_args->shared->search_stride;
+                continue;
+            }
+#else
         for (size_t offset = (size_t)thread_args->thread_id * thread_args->shared->search_stride; offset < r->size; offset += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads) 
         {
+#endif
+
             void *reg_pos = r->start + offset;
 
             /* load the next buffer block */
@@ -794,6 +821,12 @@ static void* sm_searchregions_thread_func(void* args) {
             {
                 break;
             }
+
+#if ORDERED_MATCHES
+            /* go to next block */
+            ++block_current;
+            offset += thread_args->shared->search_stride;
+#endif
         }
         
         free(data);
@@ -828,6 +861,9 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
 
     size_t total_matches_size = 0;
     size_t total_scan_bytes = 0;
+#if ORDERED_MATCHES
+    size_t total_scan_blocks = 0;
+#endif
     element_t const *n = vars->regions->head;    
 
     /* select scanroutine */
@@ -866,14 +902,6 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     total_matches_size += sizeof(matches_and_old_values_swath); /* for null terminate */
     
     show_debug("allocate array, max size %ld\n", total_matches_size);
-    
-    /* get total number of bytes */
-    for(n = vars->regions->head; n; n = n->next)
-        total_scan_bytes += ((region_t *)n->data)->size;
-
-    vars->scan_progress = 0.0;
-    vars->stop_flag = false;
-    n = vars->regions->head;
 
     /* The maximum logical size is a comfortable 1MiB (increasing it does not help).
      * The actual allocation is that plus the rounded size of the maximum possible VLT.
@@ -888,6 +916,15 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     size_t search_stride = MAX_BUFFER_SIZE;
     size_t max_read_size = MAX_ALLOC_SIZE;
 
+    /* get total number of bytes */
+    for (n = vars->regions->head; n; n = n->next) {
+        total_scan_bytes += ((region_t *)n->data)->size;
+#if ORDERED_MATCHES
+        const size_t round_up = search_stride - ((region_t *)n->data)->size % search_stride;
+        total_scan_blocks += (((region_t *)n->data)->size + round_up) / search_stride;
+#endif
+    }
+
     /* get number of threads to use */
     int num_threads = get_number_of_threads(vars->options.num_parallel_jobs);
 
@@ -896,6 +933,10 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     {
         num_threads = total_scan_bytes / search_stride;
     }
+
+    vars->scan_progress = 0.0;
+    vars->stop_flag = false;
+    n = vars->regions->head;
 
     /* create threads */
     struct sm_searchregions_thread_args* thread_args;
@@ -917,6 +958,9 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
     shared.total_scan_bytes = total_scan_bytes;
+#if ORDERED_MATCHES
+    shared.total_scan_blocks = total_scan_blocks;
+#endif
     shared.vars = vars;
 
     for (int thread_id = 0; thread_id < num_threads; thread_id++) 

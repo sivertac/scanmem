@@ -96,11 +96,6 @@ struct peekbuf_t {
     uint8_t cache[MAX_PEEKBUF_SIZE];  /* read from ptrace()  */
     unsigned size;              /* amount of valid memory stored (in bytes) */
     const char *base;           /* base address of cached region */
-#if HAVE_PROCMEM
-    int procmem_fd;             /* file descriptor of the opened `/proc/<pid>/mem` file */
-#else
-    pid_t pid;                  /* pid of scanned process */
-#endif
 };
 
 struct attach_state_t {
