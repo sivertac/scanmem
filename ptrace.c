@@ -349,7 +349,11 @@ struct sm_checkmatches_thread_shared {
     const uservalue_t *uservalue;
     scan_data_type_t scan_data_type;
     int num_threads;
+    /* used to calculate when to display progress dots */
     size_t bytes_per_sample;
+#if ORDERED_MATCHES
+    size_t number_of_swaths;
+#endif
     globals_t *vars;
 };
 
@@ -385,6 +389,15 @@ static void* sm_checkmatches_thread_func(void* args) {
     writing_swath_index->first_byte_in_child = NULL;
     writing_swath_index->number_of_bytes = 0;
 
+#if ORDERED_MATCHES
+    size_t swaths_to_scan = thread_args->shared->number_of_swaths / thread_args->shared->num_threads;
+    const size_t swath_start = swaths_to_scan * thread_args->thread_id;
+    /* if this is the last thread, make sure all swaths at the end are covered */
+    if (thread_args->thread_id == thread_args->shared->num_threads - 1) {
+        swaths_to_scan = thread_args->shared->number_of_swaths - swath_start;
+    }
+#endif
+
     struct peekbuf_t peekbuf;
     memset(&peekbuf, 0, sizeof(peekbuf));
 
@@ -392,9 +405,13 @@ static void* sm_checkmatches_thread_func(void* args) {
     size_t bytes_scanned_until_dot = 0;
     bool stop_flag = false;
 
+#if ORDERED_MATCHES
+    while (reading_swath_index->number_of_bytes > 0 && swath_index < swath_start + swaths_to_scan) {
+        if (swath_index >= swath_start) {
+#else
     while (reading_swath_index->number_of_bytes > 0) {
         if (swath_index % thread_args->shared->num_threads == thread_args->thread_id) {
-
+#endif
             int required_extra_bytes_to_record = 0;
             size_t reading_iterator = 0;
             
@@ -550,7 +567,10 @@ bool sm_checkmatches(globals_t *vars,
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
     shared.scan_data_type = vars->options.scan_data_type;
-    shared.bytes_per_sample = total_scan_bytes / NUM_SAMPLES;
+    shared.bytes_per_sample = total_scan_bytes / shared.num_threads / NUM_SAMPLES;
+#if ORDERED_MATCHES
+    shared.number_of_swaths = number_of_swaths;
+#endif
     shared.vars = vars;
 
     for (int thread_id = 0; thread_id < num_threads; thread_id++) 
