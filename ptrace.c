@@ -6,6 +6,7 @@
     Copyright (C) 2009,2010      WANG Lu <coolwanglu@gmail.com>
     Copyright (C) 2015           Sebastian Parschauer <s.parschauer@gmx.de>
     Copyright (C) 2017-2018      Andrea Stacchiotti <andreastacchiotti(a)gmail.com>
+    Copyright (C) 2023-2024      Sivert Cubedo  <sivertsac(a)gmail.com>
  
     This file is part of libscanmem.
 
