@@ -965,7 +965,8 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     /* if total bytes to read is less than num_threads * search_stride, reduce number of threads */
     if (total_scan_bytes < num_threads * search_stride) 
     {
-        num_threads = total_scan_bytes / search_stride;
+        int t = total_scan_bytes / search_stride;
+        num_threads = (t < 1) ? 1 : t;
     }
 
     vars->scan_progress = 0.0;
