@@ -576,6 +576,7 @@ bool sm_checkmatches(globals_t *vars,
 
     /* get number of threads to use */
     int num_threads = get_number_of_threads(vars->options.num_parallel_jobs);
+    show_info("using %d threads\n", num_threads);
 
     /* if number_of_swaths is less than threads, reduce number of threads */
     if (number_of_swaths < num_threads) 
@@ -961,6 +962,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
 
     /* get number of threads to use */
     int num_threads = get_number_of_threads(vars->options.num_parallel_jobs);
+    show_info("using %d threads\n", num_threads);
 
     /* if total bytes to read is less than num_threads * search_stride, reduce number of threads */
     if (total_scan_bytes < num_threads * search_stride) 
@@ -1016,15 +1018,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     }
     
     /* allocate master swath array */
-    if (!(vars->matches = allocate_array(vars->matches, total_matches_size * num_threads)))
-    {
-        show_error("could not allocate match array\n");
-        return false;
-    }
     matches_and_old_values_swath *writing_swath_index;
-    writing_swath_index = vars->matches->swaths;
-    writing_swath_index->first_byte_in_child = NULL;
-    writing_swath_index->number_of_bytes = 0;
 
     /* reset number of matches before summing results from each thread */
     vars->num_matches = 0;
@@ -1051,8 +1045,14 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
         vars->num_matches += thread_args[i].num_matches;
 
         /* merge matches */
-        writing_swath_index = concat_array(&vars->matches, writing_swath_index, thread_args[i].matches);
-        free(thread_args[i].matches);
+        if (i == 0) {
+            writing_swath_index = thread_args[i].writing_swath_index;
+            vars->matches = thread_args[i].matches;
+        }
+        else {
+            writing_swath_index = concat_array(&vars->matches, writing_swath_index, thread_args[i].matches);
+            free(thread_args[i].matches);
+        }
     }
 
     free(thread_args);
