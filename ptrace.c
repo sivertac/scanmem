@@ -374,6 +374,7 @@ struct sm_checkmatches_thread_args {
     /* output */
     unsigned long num_matches;
     matches_and_old_values_array *output_matches;
+    matches_and_old_values_swath *writing_swath_index;
 
     /* error */
     char const * error_str; /* NULL if no error */
@@ -397,9 +398,9 @@ static void* sm_checkmatches_thread_func(void* args) {
         return NULL;
     }
 
-    matches_and_old_values_swath *writing_swath_index = thread_args->output_matches->swaths;
-    writing_swath_index->first_byte_in_child = NULL;
-    writing_swath_index->number_of_bytes = 0;
+    thread_args->writing_swath_index = thread_args->output_matches->swaths;
+    thread_args->writing_swath_index->first_byte_in_child = NULL;
+    thread_args->writing_swath_index->number_of_bytes = 0;
 
     /* find relevant matches for this thread  */
     size_t swaths_to_scan = thread_args->shared->number_of_swaths / thread_args->shared->num_threads;
@@ -492,7 +493,7 @@ static void* sm_checkmatches_thread_func(void* args) {
                         - We can get away with assuming that the pointers will stay valid,
                             because as we never add more data to the array than there was before, it will not reallocate. */
 
-                        writing_swath_index = add_element(&thread_args->output_matches, writing_swath_index, address,
+                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
                                                         get_u8b(memory_ptr), checkflags);
 
                         ++thread_args->num_matches;
@@ -501,7 +502,7 @@ static void* sm_checkmatches_thread_func(void* args) {
                     }
                     else if (required_extra_bytes_to_record)
                     {
-                        writing_swath_index = add_element(&thread_args->output_matches, writing_swath_index, address,
+                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
                                                         get_u8b(memory_ptr), flags_empty);
                         --required_extra_bytes_to_record;
                     }
@@ -525,12 +526,6 @@ static void* sm_checkmatches_thread_func(void* args) {
     }
 
     free(data);
-
-    if (!(thread_args->output_matches = null_terminate(thread_args->output_matches, writing_swath_index)))
-    {
-        thread_args->error_str = "memory allocation error while reducing matches-array size";
-        return NULL;
-    }
 
     return NULL;
 }
@@ -662,7 +657,7 @@ bool sm_checkmatches(globals_t *vars,
         vars->num_matches += thread_args[i].num_matches;
 
         /* merge matches */
-        writing_swath_index = concat_array(&new_matches, writing_swath_index, thread_args[i].output_matches);
+        writing_swath_index = concat_array(&new_matches, writing_swath_index, thread_args[i].output_matches, thread_args[i].writing_swath_index);
         free(thread_args[i].output_matches);
     }
 
@@ -738,7 +733,7 @@ static void* sm_searchregions_thread_func(void* args) {
     struct sm_searchregions_thread_args* thread_args = (struct sm_searchregions_thread_args*)args;
 
     /* create matches data structure for this thread */
-    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size)))
+    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size * thread_args->shared->num_threads)))
     {
         thread_args->error_str = "could not allocate match array\n";
         return NULL;
@@ -889,7 +884,7 @@ static void* sm_searchregions_thread_func(void* args) {
         }  
     }
 
-    if (!(thread_args->matches = null_terminate(thread_args->matches, thread_args->writing_swath_index)))
+    if (!thread_args->matches)
     {
         thread_args->error_str = "memory allocation error while reducing matches-array size\n";
         return NULL;
@@ -1018,7 +1013,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     }
     
     /* allocate master swath array */
-    matches_and_old_values_swath *writing_swath_index;
+    matches_and_old_values_swath *writing_swath_index = NULL;
 
     /* reset number of matches before summing results from each thread */
     vars->num_matches = 0;
@@ -1050,7 +1045,7 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
             vars->matches = thread_args[i].matches;
         }
         else {
-            writing_swath_index = concat_array(&vars->matches, writing_swath_index, thread_args[i].matches);
+            writing_swath_index = concat_array(&vars->matches, writing_swath_index, thread_args[i].matches, thread_args[i].writing_swath_index);
             free(thread_args[i].matches);
         }
     }
