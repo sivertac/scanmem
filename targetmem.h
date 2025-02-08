@@ -250,21 +250,27 @@ add_element (matches_and_old_values_array **array,
     return swath;
 }
 
-/* returns the last empty swath in the array after the operation */
+/* returns the last swath in dest_array after concatinating source_array elements to dest_array */
 static inline matches_and_old_values_swath * concat_array(matches_and_old_values_array **dest_array,
              matches_and_old_values_swath *dest_swath, matches_and_old_values_array *source_array, matches_and_old_values_swath *source_swath) {
 
-    size_t source_size = (size_t)((void*)source_swath - (void*)source_array->swaths);
+    /* check if source swatch is empty */
+    if (source_swath == source_array->swaths) {
+        return dest_swath;
+    }
+
+    size_t source_size = (size_t)((void*)local_address_beyond_last_element(source_swath) - (void*)source_array->swaths);
+    size_t last_swath_offset = (size_t)((void*)source_swath - (void*)source_array->swaths);
+
+    dest_swath = local_address_beyond_last_element(dest_swath);
 
     /* resize dest_array to fit source_array */
-    *dest_array = allocate_enough_to_reach(*dest_array, ((void*)dest_swath) + source_size + sizeof(matches_and_old_values_swath), &dest_swath);
+    *dest_array = allocate_enough_to_reach(*dest_array, ((void*)dest_swath) + source_size, &dest_swath);
 
     /* copy source_array to dest_array */
     memcpy((void*)dest_swath, (void*)source_array->swaths, source_size);
 
-    dest_swath = (matches_and_old_values_swath*)((void*)dest_swath + source_size);
-    dest_swath->first_byte_in_child = NULL;
-    dest_swath->number_of_bytes = 0;
+    dest_swath = (matches_and_old_values_swath*)((void*)dest_swath + last_swath_offset);
 
     return dest_swath;
 }

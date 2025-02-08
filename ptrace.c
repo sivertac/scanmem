@@ -356,7 +356,6 @@ struct sm_checkmatches_thread_shared {
     scan_data_type_t scan_data_type;
     int num_threads;
     /* used to calculate when to display progress dots */
-    size_t bytes_per_sample;
     size_t number_of_swaths;
     size_t search_stride;           /* how many bytes to search at a time (for each thread) */
     size_t max_read_size;           /* how many bytes to read at a time (for each thread), should be search_stride + max_vlt_size */
@@ -457,7 +456,7 @@ static void* sm_checkmatches_thread_func(void* args) {
             /* process matches */
             while (reading_swath_index != pass_end_swath_index) {
                 
-                /* check if this swath outside inside bytes read, break and read again if it's outside */
+                /* check if this swath is outside bytes read, break and read again if it's outside */
                 if (reading_swath_index->first_byte_in_child + reading_swath_index->number_of_bytes - pass_begin_swath_index->first_byte_in_child > bytes_read) {
                     break;
                 }
@@ -596,7 +595,6 @@ bool sm_checkmatches(globals_t *vars,
     shared.attach_state = &attach_state;
     shared.uservalue = uservalue;
     shared.scan_data_type = vars->options.scan_data_type;
-    shared.bytes_per_sample = total_scan_bytes / shared.num_threads / NUM_SAMPLES;
     shared.number_of_swaths = number_of_swaths;
     shared.search_stride = MAX_BUFFER_SIZE;
     shared.max_read_size = MAX_ALLOC_SIZE;
@@ -624,15 +622,7 @@ bool sm_checkmatches(globals_t *vars,
        of same size as current master swath array 
     */
     matches_and_old_values_array *new_matches = NULL;
-    if (!(new_matches = allocate_array(new_matches, vars->matches->max_needed_bytes)))
-    {
-        show_error("could not allocate match array\n");
-        return false;
-    }
-    matches_and_old_values_swath *writing_swath_index;
-    writing_swath_index = new_matches->swaths;
-    writing_swath_index->first_byte_in_child = NULL;
-    writing_swath_index->number_of_bytes = 0;
+    matches_and_old_values_swath *writing_swath_index = NULL;
 
     /* join threads, sum up matches and merge matches */
     bool error = false;
@@ -657,8 +647,14 @@ bool sm_checkmatches(globals_t *vars,
         vars->num_matches += thread_args[i].num_matches;
 
         /* merge matches */
-        writing_swath_index = concat_array(&new_matches, writing_swath_index, thread_args[i].output_matches, thread_args[i].writing_swath_index);
-        free(thread_args[i].output_matches);
+        if (i == 0) {
+            writing_swath_index = thread_args[i].writing_swath_index;
+            new_matches = thread_args[i].output_matches;
+        }
+        else {
+            writing_swath_index = concat_array(&new_matches, writing_swath_index, thread_args[i].output_matches, thread_args[i].writing_swath_index);
+            free(thread_args[i].output_matches);
+        }
     }
 
     free(thread_args);
@@ -733,7 +729,7 @@ static void* sm_searchregions_thread_func(void* args) {
     struct sm_searchregions_thread_args* thread_args = (struct sm_searchregions_thread_args*)args;
 
     /* create matches data structure for this thread */
-    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size * thread_args->shared->num_threads)))
+    if (!(thread_args->matches = allocate_array(thread_args->matches, thread_args->shared->total_matches_size)))
     {
         thread_args->error_str = "could not allocate match array\n";
         return NULL;
