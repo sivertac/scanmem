@@ -931,18 +931,6 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
     }
 
     INTERRUPTABLESCAN();
-
-    total_matches_size = sizeof(matches_and_old_values_array);
-
-    while (n) 
-    {
-        total_matches_size += ((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath);
-        n = n->next;
-    }
-    
-    total_matches_size += sizeof(matches_and_old_values_swath); /* for null terminate */
-    
-    show_debug("allocate array, max size %ld\n", total_matches_size);
     
     /* divide up work for each thread,
        each thread will read a chunk of memory of size max_read_size (or less if near end of region),
@@ -968,6 +956,17 @@ bool sm_searchregions(globals_t *vars, scan_match_type_t match_type, const userv
         int t = total_scan_bytes / search_stride;
         num_threads = (t < 1) ? 1 : t;
     }
+
+    /* Estimate maximum matches size. Number of threads must be accounted for here since swaths can be split up depending on how work is distributed. */
+    total_matches_size = sizeof(matches_and_old_values_array);
+    n = vars->regions->head;
+    while (n) 
+    {
+        total_matches_size += (((region_t *)(n->data))->size * sizeof(old_value_and_match_info) + sizeof(matches_and_old_values_swath)) * num_threads;
+        n = n->next;
+    }
+    total_matches_size += sizeof(matches_and_old_values_swath); /* for null terminate */
+    show_debug("allocate array, max size %ld\n", total_matches_size);
 
     vars->scan_progress = 0.0;
     vars->stop_flag = false;
