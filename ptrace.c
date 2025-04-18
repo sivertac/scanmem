@@ -531,6 +531,18 @@ static void* sm_checkmatches_thread_func(void* args) {
         }
     }
 
+    /* calculate and display progress, TODO: do this interactively. */
+    if (thread_args->thread_id == 0) 
+    {
+        for (size_t i = 0; i < NUM_DOTS; ++i) {
+            print_a_dot();
+        }
+
+        /* for front-end, update percentage */
+        thread_args->shared->vars->scan_progress = 1.f;
+    }
+        
+
     free(data);
 
     return NULL;
@@ -759,21 +771,17 @@ static void* sm_searchregions_thread_func(void* args) {
     }
     size_t block_current = 0;
 
+    /* allocate data array */
+    unsigned char *data = NULL;
+    if ((data = malloc(thread_args->shared->max_read_size * sizeof(char))) == NULL) 
+    {
+        thread_args->error_str = "sorry, there was a memory allocation error.\n";
+        return NULL;
+    }
+
     while (n) 
     {
         region_t const *r = (region_t const *)n->data;
-        unsigned char *data = NULL;
-
-        size_t bytes_per_sample = r->size / NUM_SAMPLES;
-        size_t bytes_scanned_until_dot = 0;
-        
-        /* allocate data array */
-        size_t alloc_size = MIN(r->size, thread_args->shared->max_read_size);
-        if ((data = malloc(alloc_size * sizeof(char))) == NULL) 
-        {
-            thread_args->error_str = "sorry, there was a memory allocation error.\n";
-            return NULL;
-        }
 
         /* print a progress meter so user knows we haven't crashed */
         if (thread_args->thread_id == 0)
@@ -841,24 +849,6 @@ static void* sm_searchregions_thread_func(void* args) {
                 
             }
 
-            /* calculate progress */
-            if (thread_args->thread_id == 0) 
-            {
-                bytes_scanned_until_dot += thread_args->shared->search_stride * (size_t)thread_args->shared->num_threads; /* approximation */
-                if (bytes_scanned_until_dot >= bytes_per_sample * SAMPLES_PER_DOT) 
-                {
-                    /* for user, just print a dot */
-                    print_a_dot();
-                    
-                    /* for front-end, update percentage */
-                    size_t bytes_per_dot = r->size / NUM_DOTS;
-                    double progress_per_dot = (double)bytes_per_dot / thread_args->shared->total_scan_bytes;
-                    thread_args->shared->vars->scan_progress += progress_per_dot;
-
-                    bytes_scanned_until_dot = 0;
-                }
-            }
-
             /* check if we are interrupted */
             stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
             if (stop_flag) 
@@ -870,8 +860,6 @@ static void* sm_searchregions_thread_func(void* args) {
             ++block_current;
             offset += thread_args->shared->search_stride;
         }
-        
-        free(data);
 
         n = n->next;
 
@@ -881,11 +869,23 @@ static void* sm_searchregions_thread_func(void* args) {
             break;
         }
 
+        /* calculate and display progress */
         if (thread_args->thread_id == 0) 
         {
+            for (size_t i = 0; i < NUM_DOTS; ++i) {
+                /* for user, just print a dot */
+                print_a_dot();
+            }
+                
+            /* for front-end, update percentage */
+            double progress_per_dot = (double)r->size / (double)thread_args->shared->total_scan_bytes;
+            thread_args->shared->vars->scan_progress += progress_per_dot;
+
             show_user("ok\n");
         }  
     }
+
+    free(data);
 
     if (!thread_args->matches)
     {
