@@ -357,6 +357,7 @@ struct sm_checkmatches_thread_shared {
     int num_threads;
     /* used to calculate when to display progress dots */
     size_t number_of_swaths;
+    size_t total_scan_bytes;
     size_t search_stride;           /* how many bytes to search at a time (for each thread) */
     size_t max_read_size;           /* how many bytes to read at a time (for each thread), should be search_stride + max_vlt_size */
     globals_t *vars;
@@ -379,16 +380,8 @@ struct sm_checkmatches_thread_args {
     char const * error_str; /* NULL if no error */
 };
 
-/* get number of bytes between lower_swath start and upper_swath + size */
-static size_t get_relative_swath_offset_size(const matches_and_old_values_swath* lower_swath, const matches_and_old_values_swath* upper_swath) {
-    assert(lower_swath->first_byte_in_child <= upper_swath->first_byte_in_child);
-    return (size_t)upper_swath->first_byte_in_child + upper_swath->number_of_bytes - (size_t)lower_swath->first_byte_in_child;
-}
-
 static void* sm_checkmatches_thread_func(void* args) {
     struct sm_checkmatches_thread_args* thread_args = (struct sm_checkmatches_thread_args*)args;
-    
-    matches_and_old_values_swath *reading_swath_index = thread_args->input_matches->swaths;
 
     /* create matches data structure for this thread */
     if (!(thread_args->output_matches = allocate_array(thread_args->output_matches, thread_args->input_matches->max_needed_bytes)))
@@ -402,19 +395,12 @@ static void* sm_checkmatches_thread_func(void* args) {
     thread_args->writing_swath_index->number_of_bytes = 0;
 
     /* find relevant matches for this thread  */
-    size_t swaths_to_scan = thread_args->shared->number_of_swaths / thread_args->shared->num_threads;
-    const size_t swath_start = swaths_to_scan * thread_args->thread_id;
-    /* if this is the last thread, make sure all swaths at the end are covered */
+    size_t bytes_to_scan = thread_args->shared->total_scan_bytes / thread_args->shared->num_threads;
+    const size_t start_scan_offset = bytes_to_scan * thread_args->thread_id;
     if (thread_args->thread_id == thread_args->shared->num_threads - 1) {
-        swaths_to_scan = thread_args->shared->number_of_swaths - swath_start;
+        bytes_to_scan = thread_args->shared->total_scan_bytes - start_scan_offset;
     }
-
-    struct peekbuf_t peekbuf;
-    memset(&peekbuf, 0, sizeof(peekbuf));
-
-    size_t swath_index = 0;
-    size_t bytes_scanned_until_dot = 0;
-    bool stop_flag = false;
+    const size_t end_scan_offset = start_scan_offset + bytes_to_scan;
 
     uint8_t* data = NULL;
     if ((data = (uint8_t*)malloc(thread_args->shared->max_read_size * sizeof(uint8_t))) == NULL) 
@@ -423,102 +409,123 @@ static void* sm_checkmatches_thread_func(void* args) {
         return NULL;
     }
 
-    while (reading_swath_index->number_of_bytes > 0 && swath_index < swath_start + swaths_to_scan) {
-        if (swath_index >= swath_start) {
-            /* first swath to scan */
-            matches_and_old_values_swath *pass_begin_swath_index = reading_swath_index;
-            /* index beyond last swath to scan, so if end == begin, swaths_in_pass should be 0 */
-            matches_and_old_values_swath *pass_end_swath_index = pass_begin_swath_index;
-            size_t scan_size = 0;
-            size_t swaths_in_pass = 0;  
-            /* look ahead to batch up close addresses */
-            /* check that next swath is relevant for this thread, check that next swath address is within max_read_size, check if next swath will fit in next read */
-            while (swath_index - swath_start + swaths_in_pass < swaths_to_scan && pass_end_swath_index->number_of_bytes > 0 && get_relative_swath_offset_size(pass_begin_swath_index, pass_end_swath_index) <= thread_args->shared->max_read_size) {
-                assert(scan_size + pass_end_swath_index->number_of_bytes < thread_args->shared->max_read_size);
-                scan_size = get_relative_swath_offset_size(pass_begin_swath_index, pass_end_swath_index);
-                pass_end_swath_index = local_address_beyond_last_element(pass_end_swath_index);
-                ++swaths_in_pass;
+    /* scan */
+    matches_and_old_values_swath *reading_swath_index = thread_args->input_matches->swaths;
+    size_t reading_swath_byte_offset = 0;
+    size_t current_scan_byte_offset = 0;
+    while (reading_swath_index->number_of_bytes > 0) {
+
+        /* break if we're done scanning for this thread */
+        if (current_scan_byte_offset >= end_scan_offset) {
+            break;
+        }
+
+        /* determine scan size */
+        const size_t local_offset = current_scan_byte_offset - reading_swath_byte_offset;
+        assert(local_offset <= reading_swath_index->number_of_bytes);
+        size_t scan_size = MIN(reading_swath_index->number_of_bytes - local_offset, thread_args->shared->max_read_size);
+        {
+            size_t scan_end = current_scan_byte_offset + scan_size;
+
+            /* reduce to end of this thread's scan area if it will scan over */
+            if (scan_end >= end_scan_offset) {
+                size_t s = end_scan_offset - current_scan_byte_offset;
+                scan_size = MIN(s, scan_size);
+                scan_end = current_scan_byte_offset + scan_size;
             }
-            //scan_size = thread_args->shared->max_read_size;
-
-            //printf("swaths_in_pass = %lu, scan_size = %lu, pass_begin_swath_index = %p, pass_end_swath_index = %p\n", swaths_in_pass, scan_size, pass_begin_swath_index, pass_end_swath_index);
-            assert((swaths_in_pass > 0 && pass_begin_swath_index < pass_end_swath_index) || (swaths_in_pass == 0 && pass_begin_swath_index == pass_end_swath_index));
-
-            /* read from target process */
-            size_t bytes_read = sm_readmemory(data, pass_begin_swath_index->first_byte_in_child, scan_size, thread_args->shared->attach_state);
-            if (bytes_read == 0) {
-                /* failed to read memory, todo: need to figure out strategy for this case, for now go to next swath and pray */
-                reading_swath_index = local_address_beyond_last_element(reading_swath_index);
-                ++swath_index;
-                continue;
+            /* reduce size such that we reach boundery of this thread's scan area in the next iteration */
+            if (current_scan_byte_offset < start_scan_offset && scan_end >= start_scan_offset) {
+                size_t s = start_scan_offset - current_scan_byte_offset;
+                scan_size = MIN(s, scan_size);
+                scan_end = current_scan_byte_offset + scan_size;
             }
-            
-            /* process matches */
-            while (reading_swath_index != pass_end_swath_index) {
-                
-                /* check if this swath is outside bytes read, break and read again if it's outside */
-                if (reading_swath_index->first_byte_in_child + reading_swath_index->number_of_bytes - pass_begin_swath_index->first_byte_in_child > bytes_read) {
-                    break;
+            /* check that scan is either completely outside this thread's scan area, or completely inside */
+            assert(
+                (current_scan_byte_offset < start_scan_offset && scan_end <= start_scan_offset) || 
+                (current_scan_byte_offset >= end_scan_offset && scan_end >= end_scan_offset) || 
+                (current_scan_byte_offset >= start_scan_offset && current_scan_byte_offset < end_scan_offset && scan_end >= start_scan_offset && scan_end <= end_scan_offset)
+            ); 
+        }
+
+        assert(scan_size <= thread_args->shared->max_read_size);
+        assert(current_scan_byte_offset < start_scan_offset + bytes_to_scan);
+
+        /* if swath is overlapping with bytes allocated to this thread, scan */
+        if (current_scan_byte_offset >= start_scan_offset) {
+
+            assert(current_scan_byte_offset >= start_scan_offset);
+            assert(current_scan_byte_offset + scan_size <= start_scan_offset + bytes_to_scan);
+
+            size_t bytes_read = sm_readmemory(data, reading_swath_index->first_byte_in_child + local_offset, scan_size, thread_args->shared->attach_state);
+
+            int required_extra_bytes_to_record = 0;
+            for (size_t reading_iterator = 0; reading_iterator < bytes_read; ++reading_iterator) {
+                match_flags old_flags = reading_swath_index->data[reading_iterator + local_offset].match_info;
+                unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
+                void *address = reading_swath_index->first_byte_in_child + reading_iterator + local_offset;
+
+                /* read value from this address */
+                unsigned int match_length = 0;
+                const mem64_t *memory_ptr = (mem64_t*)(data + reading_iterator);
+                size_t memlength = old_length;
+                match_flags checkflags;
+                if (old_flags != flags_empty) /* Test only valid old matches */ 
+                {
+                    value_t old_val = data_to_val_aux(reading_swath_index,  reading_iterator + local_offset, reading_swath_index->number_of_bytes);
+                    checkflags = flags_empty;
+
+                    match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
                 }
-                
-                int required_extra_bytes_to_record = 0;
-                size_t reading_iterator = 0;
-                while (reading_iterator < reading_swath_index->number_of_bytes) {
-                    match_flags old_flags = reading_swath_index->data[reading_iterator].match_info;
-                    unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
-                    const void *address = reading_swath_index->first_byte_in_child + reading_iterator;
-                    const size_t match_offset = address - pass_begin_swath_index->first_byte_in_child;
 
-                    /* read value from this address */
-                    unsigned int match_length = 0;
-                    const mem64_t *memory_ptr = (mem64_t*)(data + match_offset);
-                    size_t memlength = old_length;
-                    match_flags checkflags;
-                    if (old_flags != flags_empty) /* Test only valid old matches */ 
-                    {
-                        value_t old_val = data_to_val_aux(reading_swath_index, reading_iterator, reading_swath_index->number_of_bytes);
-                        checkflags = flags_empty;
+                if (match_length > 0)
+                {
+                    assert(match_length <= memlength);
 
-                        match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
-                    }
+                    /* Still a candidate. Write data.
+                    - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
+                        and because we copied out the reading swath metadata already.
+                    - We can get away with assuming that the pointers will stay valid,
+                        because as we never add more data to the array than there was before, it will not reallocate. */
 
-                    if (match_length > 0)
-                    {
-                        assert(match_length <= memlength);
+                    thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
+                                                    get_u8b(memory_ptr), checkflags);
 
-                        /* Still a candidate. Write data.
-                        - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
-                            and because we copied out the reading swath metadata already.
-                        - We can get away with assuming that the pointers will stay valid,
-                            because as we never add more data to the array than there was before, it will not reallocate. */
+                    ++thread_args->num_matches;
 
-                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
-                                                        get_u8b(memory_ptr), checkflags);
-
-                        ++thread_args->num_matches;
-
-                        required_extra_bytes_to_record = match_length - 1;
-                    }
-                    else if (required_extra_bytes_to_record)
-                    {
-                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
-                                                        get_u8b(memory_ptr), flags_empty);
-                        --required_extra_bytes_to_record;
-                    }
-                    reading_iterator++;
+                    required_extra_bytes_to_record = match_length - 1;
                 }
-                reading_swath_index = local_address_beyond_last_element(reading_swath_index);
-                swath_index++;
-            }  
-            
+                else if (required_extra_bytes_to_record)
+                {
+                    thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
+                                                    get_u8b(memory_ptr), flags_empty);
+                    --required_extra_bytes_to_record;
+                }
+            }
+        
+            if (bytes_read > 0) {
+                current_scan_byte_offset += bytes_read;
+            }
+            else {
+                /* read failed, skip first byte */
+                current_scan_byte_offset += 1;
+            }
         }
         else {
+            assert(current_scan_byte_offset < start_scan_offset);
+            assert(scan_size > 0);
+            assert(current_scan_byte_offset + scan_size - 1 < start_scan_offset);
+
+            current_scan_byte_offset += scan_size;
+        }
+
+        /* if current swath is complete, move to next swath */
+        if (current_scan_byte_offset >= reading_swath_byte_offset + reading_swath_index->number_of_bytes) {
+            reading_swath_byte_offset += reading_swath_index->number_of_bytes;
             reading_swath_index = local_address_beyond_last_element(reading_swath_index);
-            swath_index++;
         }
 
         /* check if we are interrupted */
-        stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
+        bool stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
         if (stop_flag) {
             break;
         }
@@ -536,7 +543,6 @@ bool sm_checkmatches(globals_t *vars,
                      const uservalue_t *uservalue)
 {
     struct attach_state_t attach_state;
-
     if (sm_choose_scanroutine(vars->options.scan_data_type, match_type, uservalue, vars->options.reverse_endianness) == false)
     {
         show_error("unsupported scan for current data type.\n");
@@ -565,7 +571,7 @@ bool sm_checkmatches(globals_t *vars,
     {
         number_of_swaths++;
         total_scan_bytes += tmp_swath_index->number_of_bytes;
-        tmp_swath_index = (matches_and_old_values_swath *)(&tmp_swath_index->data[tmp_swath_index->number_of_bytes]);
+        tmp_swath_index = local_address_beyond_last_element(tmp_swath_index);
     }
 
     /* get number of threads to use */
@@ -596,6 +602,7 @@ bool sm_checkmatches(globals_t *vars,
     shared.uservalue = uservalue;
     shared.scan_data_type = vars->options.scan_data_type;
     shared.number_of_swaths = number_of_swaths;
+    shared.total_scan_bytes = total_scan_bytes;
     shared.search_stride = MAX_BUFFER_SIZE;
     shared.max_read_size = MAX_ALLOC_SIZE;
     shared.vars = vars;

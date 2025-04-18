@@ -255,14 +255,17 @@ static inline matches_and_old_values_swath * concat_array(matches_and_old_values
              matches_and_old_values_swath *dest_swath, matches_and_old_values_array *source_array, matches_and_old_values_swath *source_swath) {
 
     /* check if source swatch is empty */
-    if (source_swath == source_array->swaths) {
+    if (source_swath == source_array->swaths && source_swath->number_of_bytes == 0) {
         return dest_swath;
     }
 
     size_t source_size = (size_t)((void*)local_address_beyond_last_element(source_swath) - (void*)source_array->swaths);
     size_t last_swath_offset = (size_t)((void*)source_swath - (void*)source_array->swaths);
 
-    dest_swath = local_address_beyond_last_element(dest_swath);
+    /* if last swath of dest array is not empty, write source array after the last swath */
+    if (dest_swath->number_of_bytes > 0) {
+        dest_swath = local_address_beyond_last_element(dest_swath);
+    }
 
     /* resize dest_array to fit source_array */
     *dest_array = allocate_enough_to_reach(*dest_array, ((void*)dest_swath) + source_size, &dest_swath);
