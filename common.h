@@ -28,6 +28,9 @@
 #ifndef MIN
 # define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
+#ifndef MAX
+# define MAX(a,b) ((a) > (b) ? (a) : (b))
+#endif
 
 /* From `include/linux/compiler.h`, in the linux kernel:
  * Offers a simple interface to the expect builtin */
