@@ -869,7 +869,7 @@ static void* sm_searchregions_thread_func(void* args) {
                 checkflags = flags_empty;
                 
                 /* check if we have a match */
-                match_length = (*sm_scan_routine)(memory_ptr, search_area - i, NULL, thread_args->shared->uservalue, &checkflags);
+                match_length = (*sm_scan_routine)(memory_ptr, nread - i, NULL, thread_args->shared->uservalue, &checkflags);
                 
                 if (UNLIKELY(match_length > 0))
                 {
