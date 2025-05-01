@@ -390,6 +390,10 @@ static void* sm_checkmatches_thread_func(void* args) {
         return NULL;
     }
 
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+    assert(thread_args->shared->max_read_size > thread_args->shared->search_stride);
+    const size_t vlt_tail = thread_args->shared->max_read_size - thread_args->shared->search_stride;
+
     thread_args->writing_swath_index = thread_args->output_matches->swaths;
     thread_args->writing_swath_index->first_byte_in_child = NULL;
     thread_args->writing_swath_index->number_of_bytes = 0;
@@ -492,73 +496,88 @@ static void* sm_checkmatches_thread_func(void* args) {
                 }
                 current_scan_byte_offset += s;
                 actual_end_ptr = reading_swath_index->first_byte_in_child + (current_scan_byte_offset - reading_swath_byte_offset);
-                reading_swath_byte_offset = current_scan_byte_offset; 
+                reading_swath_byte_offset = current_scan_byte_offset;
                 reading_swath_index = next_swath;
                 
                 ++number_of_swaths_scanned;
                 number_of_bytes_scanned += s;
-            }            
+            }
             assert(reading_swath_byte_offset <= current_scan_byte_offset);
 
-            const size_t vlt_tail = thread_args->shared->max_read_size - thread_args->shared->search_stride;
             size_t scan_size = actual_end_ptr - start_ptr;
             size_t actual_scan_size = scan_size + vlt_tail;
             
             assert(actual_scan_size <= thread_args->shared->max_read_size);
 
-            size_t bytes_read = sm_readmemory(data, start_ptr, actual_scan_size, thread_args->shared->attach_state);
-
             int required_extra_bytes_to_record = 0;
             size_t reading_iterator = 0;
-            while (reading_iterator < MIN(scan_size, bytes_read)) {
-                assert((start_ptr + reading_iterator) >= pass_begin_swath_index->first_byte_in_child);
-                const size_t swath_offset = (start_ptr + reading_iterator) - pass_begin_swath_index->first_byte_in_child;
-                
-                //printf("reading_iterator = %lu, bytes_read = %lu, swath_offset = %lu\n", reading_iterator, bytes_read, swath_offset);
+            size_t bytes_read = 0;
+            while (reading_iterator < scan_size) {
 
-                match_flags old_flags = pass_begin_swath_index->data[swath_offset].match_info;
-                unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
-                void *address = pass_begin_swath_index->first_byte_in_child + swath_offset;
-
-                /* read value from this address */
-                unsigned int match_length = 0;
-                const mem64_t *memory_ptr = (mem64_t*)(data + reading_iterator);
-                size_t memlength = old_length;
-                match_flags checkflags;
-                if (old_flags != flags_empty) /* Test only valid old matches */ 
-                {
-                    value_t old_val = data_to_val_aux(pass_begin_swath_index,  swath_offset, pass_begin_swath_index->number_of_bytes);
-                    checkflags = flags_empty;
-
-                    match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
+                if (bytes_read <= reading_iterator) {
+                    size_t res = sm_readmemory(data + reading_iterator, start_ptr + reading_iterator, actual_scan_size - reading_iterator, thread_args->shared->attach_state);
+                    bytes_read = reading_iterator + res;
                 }
 
-                if (match_length > 0)
-                {
-                    assert(match_length <= memlength);
+                if (bytes_read > reading_iterator) {
+                    assert((start_ptr + reading_iterator) >= pass_begin_swath_index->first_byte_in_child);
+                    const size_t swath_offset = (start_ptr + reading_iterator) - pass_begin_swath_index->first_byte_in_child;
+                    
+                    match_flags old_flags = pass_begin_swath_index->data[swath_offset].match_info;
+                    unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
+                    void *address = pass_begin_swath_index->first_byte_in_child + swath_offset;
 
-                    /* Still a candidate. Write data.
-                    - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
-                        and because we copied out the reading swath metadata already.
-                    - We can get away with assuming that the pointers will stay valid,
-                        because as we never add more data to the array than there was before, it will not reallocate. */
+                    /* read value from this address */
+                    unsigned int match_length = 0;
+                    const mem64_t *memory_ptr = (mem64_t*)(data + reading_iterator);
+                    size_t memlength = bytes_read - reading_iterator;
+                    match_flags checkflags;
+                    if (old_flags != flags_empty) /* Test only valid old matches */ 
+                    {
+                        value_t old_val = data_to_val_aux(pass_begin_swath_index,  swath_offset, pass_begin_swath_index->number_of_bytes);
+                        memlength = old_length < memlength ? old_length : memlength;
+                        
+                        checkflags = flags_empty;
 
-                    thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
-                                                    get_u8b(memory_ptr), checkflags);
+                        match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
+                    }
 
-                    ++thread_args->num_matches;
+                    if (match_length > 0)
+                    {
+                        assert(match_length <= memlength);
 
-                    required_extra_bytes_to_record = match_length - 1;
+                        /* Still a candidate. Write data.
+                        - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
+                            and because we copied out the reading swath metadata already.
+                        - We can get away with assuming that the pointers will stay valid,
+                            because as we never add more data to the array than there was before, it will not reallocate. */
+
+                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
+                                                        get_u8b(memory_ptr), checkflags);
+
+                        ++thread_args->num_matches;
+
+                        required_extra_bytes_to_record = match_length - 1;
+                    }
+                    else if (required_extra_bytes_to_record)
+                    {
+                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
+                                                        get_u8b(memory_ptr), flags_empty);
+                        --required_extra_bytes_to_record;
+                    }
                 }
-                else if (required_extra_bytes_to_record)
-                {
-                    thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
-                                                    get_u8b(memory_ptr), flags_empty);
-                    --required_extra_bytes_to_record;
+
+                /* Increment reading iterator. */
+                /* If the byte we tried to read failed, assume this page is not accesible anymore, skip to next page. */
+                if (bytes_read <= reading_iterator) {
+                    const void* current_ptr = start_ptr + reading_iterator;
+                    const void* next_ptr = (void*)((size_t)(current_ptr + page_size) & ~(page_size - 1));
+                    reading_iterator += next_ptr - current_ptr;
+                }
+                else {
+                    ++reading_iterator;
                 }
 
-                /* increment reading iterator */
-                ++reading_iterator;
                 if (required_extra_bytes_to_record == 0 && start_ptr + reading_iterator >= pass_begin_swath_index->first_byte_in_child + pass_begin_swath_index->number_of_bytes && pass_begin_swath_index != reading_swath_index) {
                     /* if there is no more bytes to record and this swath is done, go to next swath */
                     pass_begin_swath_index = local_address_beyond_last_element(pass_begin_swath_index);
