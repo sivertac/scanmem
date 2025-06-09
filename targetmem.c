@@ -29,6 +29,7 @@
 
 #include "targetmem.h"
 #include "value.h"
+#include "common.h"
 
 
 matches_and_old_values_array *
@@ -78,6 +79,32 @@ null_terminate (matches_and_old_values_array *array,
     }
 
     return array;
+}
+
+void dump_matches_and_old_values_array(matches_and_old_values_array *array, matches_and_old_values_swath *swath, const char* filename) {
+#define MAX_STR_SIZE 0x1000
+    
+    FILE* file = fopen(filename, "w");
+
+    matches_and_old_values_swath* tmp = array->swaths;
+    while (true) {        
+        for (size_t i = 0; i < tmp->number_of_bytes; ++i) {
+            char str[MAX_STR_SIZE];
+
+            void* ptr = tmp->first_byte_in_child + i;
+            match_flags match_flags = tmp->data[i].match_info;
+            value_t val = data_to_val_aux(tmp,  i, tmp->number_of_bytes);
+            
+            int s = snprintf(str, MAX_STR_SIZE, "%p\t%#18lx\t%#08x\n", ptr, val.uint64_value, match_flags);
+
+            fwrite(str, s, 1, file);
+        } 
+
+        if (tmp == swath) break;
+        tmp = (matches_and_old_values_swath*)local_address_beyond_last_element(tmp);
+    }
+
+    fclose(file);
 }
 
 void data_to_printable_string (char *buf, int buf_length,
@@ -210,4 +237,81 @@ delete_in_address_range (matches_and_old_values_array *array,
     }
 
     return null_terminate(array, writing_swath_index);
+}
+
+matches_and_old_values_swath* concat_array(matches_and_old_values_array **dest_array, matches_and_old_values_swath *dest_swath, matches_and_old_values_array *source_array, matches_and_old_values_swath *source_swath) {
+
+    /* check if source swatch is empty */
+    if (source_swath == source_array->swaths && source_swath->number_of_bytes == 0) {
+        return dest_swath;
+    }
+    
+    if (dest_swath->number_of_bytes > 0 && (uint8_t*)dest_swath->first_byte_in_child + dest_swath->number_of_bytes > (uint8_t*)source_array->swaths[0].first_byte_in_child) {
+        /* overlapping */
+        assert(dest_swath->number_of_bytes > 0);
+        assert(source_array->swaths[0].number_of_bytes > 0);
+
+        size_t offset = (size_t)source_array->swaths[0].first_byte_in_child - (size_t)dest_swath->first_byte_in_child;
+        size_t source_total_number_of_bytes = offset + source_array->swaths[0].number_of_bytes;
+        size_t merge_swath_number_of_bytes = 0;
+        
+        merge_swath_number_of_bytes = MAX(source_total_number_of_bytes, dest_swath->number_of_bytes);
+        
+        matches_and_old_values_swath* next_dest_swath = (matches_and_old_values_swath*)local_address_beyond_nth_element(dest_swath, merge_swath_number_of_bytes - 1);
+
+        size_t source_size = 0;
+        size_t last_swath_offset = 0;
+        matches_and_old_values_swath* next_source_swath = NULL;
+
+        /* determine how much to allocate */
+        void* last_byte_to_reach_plus_one;
+        if (source_swath == source_array->swaths) {
+            /* only 1 swath in source array */
+            last_byte_to_reach_plus_one = (void*)next_dest_swath;
+        }
+        else {
+            next_source_swath = (matches_and_old_values_swath*)local_address_beyond_last_element(&source_array->swaths[0]);
+            source_size = (size_t)local_address_beyond_last_element(source_swath) - (size_t)next_source_swath;
+            last_swath_offset = (size_t)source_swath - (size_t)next_source_swath;
+            last_byte_to_reach_plus_one = (void*)((size_t)next_dest_swath + source_size);
+        }
+
+        /* resize dest_array to fit source_array */
+        *dest_array = allocate_enough_to_reach(*dest_array, last_byte_to_reach_plus_one, &dest_swath);
+
+        dest_swath->number_of_bytes = merge_swath_number_of_bytes;
+
+        assert(offset + source_array->swaths[0].number_of_bytes == dest_swath->number_of_bytes);
+
+        /* copy overlapping source swath to overlapping dest swath */
+        memcpy(dest_swath->data + offset, source_array->swaths[0].data, source_array->swaths[0].number_of_bytes * sizeof(old_value_and_match_info));
+
+        /* copy rest of source swaths */
+        if (source_size > 0) {
+            /* next_dest_swath has to be set again due to allocate_enough_to_reach possibly mocing dest_array */
+            next_dest_swath = (matches_and_old_values_swath*)local_address_beyond_last_element(dest_swath);
+            memcpy((void*)next_dest_swath, next_source_swath, source_size);
+            dest_swath = next_dest_swath + last_swath_offset;
+        }
+    }
+    else {
+        /* regular concat */
+        size_t source_size = (size_t)local_address_beyond_last_element(source_swath) - (size_t)source_array->swaths;
+        size_t last_swath_offset = (size_t)source_swath - (size_t)source_array->swaths;
+        
+        if (dest_swath->number_of_bytes > 0) {
+            /* if last swath of dest array is not empty, write source array after the last swath */
+            dest_swath = (matches_and_old_values_swath*)local_address_beyond_last_element(dest_swath);
+        }
+
+        /* resize dest_array to fit source_array */
+        *dest_array = allocate_enough_to_reach(*dest_array, (void*)((size_t)dest_swath + source_size), &dest_swath);
+
+        /* copy source_array to dest_array */
+        memcpy((void*)dest_swath, (void*)source_array->swaths, source_size);
+
+        dest_swath = (matches_and_old_values_swath*)((size_t)dest_swath + last_swath_offset);
+    }
+
+    return dest_swath;
 }

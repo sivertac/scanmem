@@ -76,6 +76,9 @@ matches_and_old_values_array *allocate_array (matches_and_old_values_array *arra
 matches_and_old_values_array *null_terminate (matches_and_old_values_array *array,
                                               matches_and_old_values_swath *swath);
 
+/* dump contents of array, swath is the last swath of array to dump */
+void dump_matches_and_old_values_array(matches_and_old_values_array *array, matches_and_old_values_swath *swath, const char* filename);
+
 /* for printable text representation */
 void data_to_printable_string (char *buf, int buf_length,
                                matches_and_old_values_swath *swath,
@@ -251,32 +254,7 @@ add_element (matches_and_old_values_array **array,
 }
 
 /* returns the last swath in dest_array after concatinating source_array elements to dest_array */
-static inline matches_and_old_values_swath * concat_array(matches_and_old_values_array **dest_array,
-             matches_and_old_values_swath *dest_swath, matches_and_old_values_array *source_array, matches_and_old_values_swath *source_swath) {
-
-    /* check if source swatch is empty */
-    if (source_swath == source_array->swaths && source_swath->number_of_bytes == 0) {
-        return dest_swath;
-    }
-
-    size_t source_size = (size_t)((void*)local_address_beyond_last_element(source_swath) - (void*)source_array->swaths);
-    size_t last_swath_offset = (size_t)((void*)source_swath - (void*)source_array->swaths);
-
-    /* if last swath of dest array is not empty, write source array after the last swath */
-    if (dest_swath->number_of_bytes > 0) {
-        dest_swath = local_address_beyond_last_element(dest_swath);
-    }
-
-    /* resize dest_array to fit source_array */
-    *dest_array = allocate_enough_to_reach(*dest_array, ((void*)dest_swath) + source_size, &dest_swath);
-
-    /* copy source_array to dest_array */
-    memcpy((void*)dest_swath, (void*)source_array->swaths, source_size);
-
-    dest_swath = (matches_and_old_values_swath*)((void*)dest_swath + last_swath_offset);
-
-    return dest_swath;
-}
+matches_and_old_values_swath* concat_array(matches_and_old_values_array **dest_array, matches_and_old_values_swath *dest_swath, matches_and_old_values_array *source_array, matches_and_old_values_swath *source_swath);
 
 /* only at most sizeof(int64_t) bytes will be read,
    if more bytes are needed (e.g. bytearray),

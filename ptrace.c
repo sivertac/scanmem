@@ -531,7 +531,7 @@ static void* sm_checkmatches_thread_func(void* args) {
                     unsigned int match_length = 0;
                     const mem64_t *memory_ptr = (mem64_t*)(data + reading_iterator);
                     size_t memlength = bytes_read - reading_iterator;
-                    match_flags checkflags;
+                    match_flags checkflags = flags_empty;
                     if (old_flags != flags_empty) /* Test only valid old matches */ 
                     {
                         value_t old_val = data_to_val_aux(pass_begin_swath_index,  swath_offset, pass_begin_swath_index->number_of_bytes);
@@ -852,6 +852,7 @@ static void* sm_searchregions_thread_func(void* args) {
         }
 
         /* For every offset, check if we have a match. */
+        int required_extra_bytes_to_record = 0;
         size_t offset = 0;
         while (block_current < block_start + blocks_to_scan && offset < r->size) {
             /* check if current block is relevant for this thread, if not go to next */
@@ -860,6 +861,8 @@ static void* sm_searchregions_thread_func(void* args) {
                 offset += thread_args->shared->search_stride;
                 continue;
             }
+
+            bool last_block = block_current == block_start + blocks_to_scan - 1;
 
             void *reg_pos = r->start + offset;
 
@@ -873,8 +876,6 @@ static void* sm_searchregions_thread_func(void* args) {
                 show_warn("reading region %02u failed.\n", r->start);
                 break;
             }
-
-            int required_extra_bytes_to_record = 0;
 
             /* search for matches */
             size_t search_area = MIN(nread, thread_args->shared->search_stride);
@@ -907,6 +908,19 @@ static void* sm_searchregions_thread_func(void* args) {
                     --required_extra_bytes_to_record;
                 }
                 
+            }
+
+            if (last_block && required_extra_bytes_to_record) {
+                /* store extra bytes at end of last block */
+                for (size_t i = 0; i < required_extra_bytes_to_record; ++i) {
+                    size_t data_offset = search_area + i;
+                    if (data_offset > nread) {
+                        break;
+                    }
+                    const mem64_t* memory_ptr = (mem64_t*)(data + data_offset);
+                    thread_args->writing_swath_index = add_element(&thread_args->matches, thread_args->writing_swath_index, reg_pos + data_offset,
+                                                    get_u8b(memory_ptr), flags_empty);
+                }
             }
 
             /* check if we are interrupted */
