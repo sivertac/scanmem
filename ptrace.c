@@ -380,6 +380,89 @@ struct sm_checkmatches_thread_args {
     char const * error_str; /* NULL if no error */
 };
 
+static void sm_checkmatches_traverse_to_offset(matches_and_old_values_swath *in_swath_index, size_t offset, matches_and_old_values_swath **out_swath_index, size_t* out_swath_local_offset) {
+    size_t current_offset = 0;
+    matches_and_old_values_swath* current_swath_index = in_swath_index;
+    size_t current_local_swath_offset = 0;
+
+    while (current_offset < offset && current_swath_index->number_of_bytes > 0) {
+        if (current_offset + current_swath_index->number_of_bytes > offset) {
+            /* offset is in this swath */
+            current_local_swath_offset = offset - current_offset;
+            current_offset += current_local_swath_offset;
+            assert(current_offset == offset);
+            break;
+        }
+        
+        /* go to next swath */
+        current_offset += current_swath_index->number_of_bytes;
+        current_swath_index = local_address_beyond_last_element(current_swath_index);
+    }
+
+    *out_swath_index = current_swath_index;
+    *out_swath_local_offset = current_local_swath_offset;
+}
+
+/**
+    @param begin_swath_index inclusive
+    @param begin_local_offset inclusive
+    @param begin_global_offset inclusive
+    @param end_global_offset exclusive
+    @param search_stride
+    @param out_end_global_offset exclusive 
+    @param out_last_swath_index inclusive
+    @param out_end_local_offset exclusive
+*/
+static void sm_checkmatches_find_scan_batch(matches_and_old_values_swath *begin_swath_index, size_t begin_local_offset, size_t begin_global_offset, size_t end_global_offset, size_t search_stride, size_t *out_end_global_offset, matches_and_old_values_swath **out_last_swath_index, size_t *out_end_local_offset) {
+
+    assert(begin_global_offset < end_global_offset);
+    assert(begin_local_offset <= begin_swath_index->number_of_bytes);
+
+    size_t current_global_offset = begin_global_offset;
+    matches_and_old_values_swath *current_swath_index = begin_swath_index;
+    size_t current_local_offset = begin_local_offset;
+    size_t address_space_diff = 0;
+    void* address_space_start_ptr = begin_swath_index->first_byte_in_child + begin_local_offset;
+
+    while (true) {
+        assert(address_space_diff < search_stride);
+        size_t max_scan = current_swath_index->number_of_bytes - current_local_offset;
+        if (address_space_diff + max_scan > search_stride) {
+            /* if search stride will end inside this swath */
+            max_scan = MIN(search_stride - address_space_diff, max_scan);
+        }
+
+        if (current_global_offset + max_scan > end_global_offset) {
+            /* if thread scan area will end inside this swath */
+            max_scan = MIN(end_global_offset - current_global_offset, max_scan);
+        }
+
+        current_global_offset += max_scan;
+        current_local_offset += max_scan;
+
+        matches_and_old_values_swath *next_swath_index = local_address_beyond_last_element(current_swath_index);
+        if (next_swath_index->number_of_bytes == 0) {
+            break;
+        }
+        
+        address_space_diff = next_swath_index->first_byte_in_child - (begin_swath_index->first_byte_in_child + begin_local_offset);
+        if (current_local_offset < current_swath_index->number_of_bytes || current_global_offset >= end_global_offset || address_space_diff >= search_stride) {
+            break;
+        }
+        
+        current_swath_index = next_swath_index;
+        current_local_offset = 0;
+    }
+
+    *out_end_global_offset = current_global_offset;
+    *out_last_swath_index = current_swath_index;
+    *out_end_local_offset = current_local_offset;
+
+    assert(*out_end_global_offset <= end_global_offset);
+    assert(*out_end_local_offset <= (*out_last_swath_index)->number_of_bytes);
+    assert((*out_last_swath_index)->first_byte_in_child != NULL);
+}
+
 static void* sm_checkmatches_thread_func(void* args) {
     struct sm_checkmatches_thread_args* thread_args = (struct sm_checkmatches_thread_args*)args;
 
@@ -412,198 +495,139 @@ static void* sm_checkmatches_thread_func(void* args) {
         thread_args->error_str = "sorry, there was a memory allocation error.\n";
         return NULL;
     }
-    
-    size_t number_of_swaths_scanned = 0;
-    size_t number_of_bytes_scanned = 0;
 
-    matches_and_old_values_swath *reading_swath_index = thread_args->input_matches->swaths;
-    size_t reading_swath_byte_offset = 0;
-    size_t current_scan_byte_offset = 0;
-    while (current_scan_byte_offset < thread_args->shared->total_scan_bytes) {
-        /* Handle if thread is ahead of scan region. */
-        if (current_scan_byte_offset < start_scan_offset) {
-            size_t next_swath_offset = current_scan_byte_offset + reading_swath_index->number_of_bytes;
-            if (next_swath_offset < start_scan_offset) {
-                current_scan_byte_offset = next_swath_offset;
-                reading_swath_byte_offset = next_swath_offset; 
-                reading_swath_index = local_address_beyond_last_element(reading_swath_index);
+    matches_and_old_values_swath *reading_swath_index = NULL;
+    size_t reading_swath_local_offset = 0;
+    sm_checkmatches_traverse_to_offset(thread_args->input_matches->swaths, start_scan_offset, &reading_swath_index, &reading_swath_local_offset);
+
+    size_t current_begin_global_offset = start_scan_offset;
+    size_t current_end_global_offset;
+    matches_and_old_values_swath *current_begin_swath_index = reading_swath_index;
+    matches_and_old_values_swath *current_last_swath_index;
+    size_t current_begin_swath_local_offset = reading_swath_local_offset;
+    size_t current_end_swath_local_offset;
+
+    int required_extra_bytes_to_record = 0;
+
+    while (current_begin_global_offset < end_scan_offset) {
+        while (true) {
+            sm_checkmatches_find_scan_batch(current_begin_swath_index, current_begin_swath_local_offset, current_begin_global_offset, end_scan_offset, thread_args->shared->search_stride, &current_end_global_offset, &current_last_swath_index, &current_end_swath_local_offset);
+            if (current_end_global_offset > current_begin_global_offset) {
+                break;
             }
-            else {
-                current_scan_byte_offset = start_scan_offset;
+            current_begin_swath_index = local_address_beyond_last_element(current_begin_swath_index);
+            current_begin_swath_local_offset = 0;
+        }
+
+        /* scan */
+        const void* start_ptr = current_begin_swath_index->first_byte_in_child + current_begin_swath_local_offset; /* inclusive */
+        const void* end_ptr = current_last_swath_index->first_byte_in_child + current_end_swath_local_offset; /* exclusive */
+        assert(start_ptr != NULL);
+        assert(end_ptr != NULL);
+        
+        const size_t scan_size = end_ptr - start_ptr;
+        const size_t actual_scan_size = scan_size + vlt_tail;
+
+        size_t bytes_read = 0;
+        size_t reading_iterator = 0;
+        while (reading_iterator < scan_size) {
+
+            /* try to read memory */
+            if (bytes_read <= reading_iterator) {
+                size_t res = sm_readmemory(data + reading_iterator, start_ptr + reading_iterator, actual_scan_size - reading_iterator, thread_args->shared->attach_state);
+                bytes_read = reading_iterator + res;
             }
-        }
-        else if (current_scan_byte_offset >= end_scan_offset) {
-            break;
-        }
-        else {
-            /* first swath to scan */
-            matches_and_old_values_swath* pass_begin_swath_index = reading_swath_index;
-            /* look ahead to batch up close addresses */
-            assert(current_scan_byte_offset >= reading_swath_byte_offset);
-            const void* start_ptr = pass_begin_swath_index->first_byte_in_child + (current_scan_byte_offset - reading_swath_byte_offset);
-            const void* end_ptr = start_ptr + thread_args->shared->search_stride;
-            void* actual_end_ptr = (void*)start_ptr;
-            while (current_scan_byte_offset < end_scan_offset) {
-                assert(reading_swath_index->number_of_bytes > 0);
 
-                matches_and_old_values_swath* next_swath = local_address_beyond_last_element(reading_swath_index);
-
-                if ((next_swath->first_byte_in_child >= end_ptr || next_swath->number_of_bytes <= 0) && start_ptr < reading_swath_index->first_byte_in_child + reading_swath_index->number_of_bytes) {
-                    /* nothing in next swath will fit in this scan */
-
-                    size_t local_offset = current_scan_byte_offset - reading_swath_byte_offset;
-
-                    if (reading_swath_index->first_byte_in_child + reading_swath_index->number_of_bytes > end_ptr) {
-                        /* next scan will be on the same swath */
-                        size_t s = (end_ptr - reading_swath_index->first_byte_in_child) - local_offset;
-                        if (current_scan_byte_offset + s > end_scan_offset) {
-                            /* if this threads search area is complete */
-                            s = end_scan_offset - current_scan_byte_offset;
-                        }
-                        current_scan_byte_offset += s;
-                        actual_end_ptr = reading_swath_index->first_byte_in_child + (current_scan_byte_offset - reading_swath_byte_offset); 
-
-                        number_of_bytes_scanned += s;
-                    }
-                    else {
-                        /* next scan will be on next swath */
-                        size_t s = reading_swath_index->number_of_bytes - local_offset;
-                        if (current_scan_byte_offset + s > end_scan_offset) {
-                            /* if this threads search area is complete */
-                            s = end_scan_offset - current_scan_byte_offset;
-                        }
-                        current_scan_byte_offset += s;
-                        actual_end_ptr = reading_swath_index->first_byte_in_child + (current_scan_byte_offset - reading_swath_byte_offset);
-                        reading_swath_byte_offset = current_scan_byte_offset;
-                        reading_swath_index = next_swath;
-
-                        number_of_bytes_scanned += s;
-                        ++number_of_swaths_scanned;
-                    }
-
-                    break;
-                }
-
-                /* if first swath in pass, account for offset from previous scan */
-                size_t s = (reading_swath_index == pass_begin_swath_index) ? reading_swath_index->number_of_bytes - (start_ptr - reading_swath_index->first_byte_in_child) : reading_swath_index->number_of_bytes;
-                if (current_scan_byte_offset + s > end_scan_offset) {
-                    /* if this threads search area is complete */
-                    s = end_scan_offset - current_scan_byte_offset;
-                    current_scan_byte_offset += s;
-                    actual_end_ptr = reading_swath_index->first_byte_in_child + (current_scan_byte_offset - reading_swath_byte_offset);
-                    number_of_bytes_scanned += s;
-                    break;
-                }
-                current_scan_byte_offset += s;
-                actual_end_ptr = reading_swath_index->first_byte_in_child + (current_scan_byte_offset - reading_swath_byte_offset);
-                reading_swath_byte_offset = current_scan_byte_offset;
-                reading_swath_index = next_swath;
+            if (bytes_read > reading_iterator) {
+                assert((start_ptr + reading_iterator) >= current_begin_swath_index->first_byte_in_child);
+                const size_t swath_offset = (start_ptr + reading_iterator) - current_begin_swath_index->first_byte_in_child;
                 
-                ++number_of_swaths_scanned;
-                number_of_bytes_scanned += s;
-            }
-            assert(reading_swath_byte_offset <= current_scan_byte_offset);
+                match_flags old_flags = current_begin_swath_index->data[swath_offset].match_info;
+                unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
+                void *address = current_begin_swath_index->first_byte_in_child + swath_offset;
 
-            size_t scan_size = actual_end_ptr - start_ptr;
-            size_t actual_scan_size = scan_size + vlt_tail;
-            
-            assert(actual_scan_size <= thread_args->shared->max_read_size);
-
-            int required_extra_bytes_to_record = 0;
-            size_t reading_iterator = 0;
-            size_t bytes_read = 0;
-            while (reading_iterator < scan_size) {
-
-                if (bytes_read <= reading_iterator) {
-                    size_t res = sm_readmemory(data + reading_iterator, start_ptr + reading_iterator, actual_scan_size - reading_iterator, thread_args->shared->attach_state);
-                    bytes_read = reading_iterator + res;
-                }
-
-                if (bytes_read > reading_iterator) {
-                    assert((start_ptr + reading_iterator) >= pass_begin_swath_index->first_byte_in_child);
-                    const size_t swath_offset = (start_ptr + reading_iterator) - pass_begin_swath_index->first_byte_in_child;
+                /* read value from this address */
+                unsigned int match_length = 0;
+                const mem64_t *memory_ptr = (mem64_t*)(data + reading_iterator);
+                size_t memlength = bytes_read - reading_iterator;
+                match_flags checkflags = flags_empty;
+                if (old_flags != flags_empty) /* Test only valid old matches */ 
+                {
+                    value_t old_val = data_to_val_aux(current_begin_swath_index,  swath_offset, current_begin_swath_index->number_of_bytes);
+                    memlength = old_length < memlength ? old_length : memlength;
                     
-                    match_flags old_flags = pass_begin_swath_index->data[swath_offset].match_info;
-                    unsigned int old_length = flags_to_memlength(thread_args->shared->scan_data_type, old_flags);
-                    void *address = pass_begin_swath_index->first_byte_in_child + swath_offset;
+                    checkflags = flags_empty;
 
-                    /* read value from this address */
-                    unsigned int match_length = 0;
-                    const mem64_t *memory_ptr = (mem64_t*)(data + reading_iterator);
-                    size_t memlength = bytes_read - reading_iterator;
-                    match_flags checkflags = flags_empty;
-                    if (old_flags != flags_empty) /* Test only valid old matches */ 
-                    {
-                        value_t old_val = data_to_val_aux(pass_begin_swath_index,  swath_offset, pass_begin_swath_index->number_of_bytes);
-                        memlength = old_length < memlength ? old_length : memlength;
-                        
-                        checkflags = flags_empty;
-
-                        match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
-                    }
-
-                    if (match_length > 0)
-                    {
-                        assert(match_length <= memlength);
-
-                        /* Still a candidate. Write data.
-                        - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
-                            and because we copied out the reading swath metadata already.
-                        - We can get away with assuming that the pointers will stay valid,
-                            because as we never add more data to the array than there was before, it will not reallocate. */
-
-                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
-                                                        get_u8b(memory_ptr), checkflags);
-
-                        ++thread_args->num_matches;
-
-                        required_extra_bytes_to_record = match_length - 1;
-                    }
-                    else if (required_extra_bytes_to_record)
-                    {
-                        thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
-                                                        get_u8b(memory_ptr), flags_empty);
-                        --required_extra_bytes_to_record;
-                    }
+                    match_length = (*sm_scan_routine)(memory_ptr, memlength, &old_val, thread_args->shared->uservalue, &checkflags);
                 }
 
-                /* Increment reading iterator. */
-                /* If the byte we tried to read failed, assume this page is not accesible anymore, skip to next page. */
-                if (bytes_read <= reading_iterator) {
-                    const void* current_ptr = start_ptr + reading_iterator;
-                    const void* next_ptr = (void*)((size_t)(current_ptr + page_size) & ~(page_size - 1));
-                    reading_iterator += next_ptr - current_ptr;
+                if (match_length > 0)
+                {
+                    assert(match_length <= memlength);
+
+                    /* Still a candidate. Write data.
+                    - We can get away with overwriting in the same array because it is guaranteed to take up the same number of bytes or fewer,
+                        and because we copied out the reading swath metadata already.
+                    - We can get away with assuming that the pointers will stay valid,
+                        because as we never add more data to the array than there was before, it will not reallocate. */
+
+                    thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
+                                                    get_u8b(memory_ptr), checkflags);
+
+                    ++thread_args->num_matches;
+
+                    required_extra_bytes_to_record = match_length - 1;
+                }
+                else if (required_extra_bytes_to_record)
+                {
+                    thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, address,
+                                                    get_u8b(memory_ptr), flags_empty);
+                    --required_extra_bytes_to_record;
+                }
+            }
+
+            /* increment reading_iterator */
+            /* If the byte we tried to read failed, assume this page is not accesible anymore, skip to next page. */
+            if (bytes_read <= reading_iterator) {
+                const void* current_ptr = start_ptr + reading_iterator;
+                const void* next_ptr = (void*)((size_t)(current_ptr + page_size) & ~(page_size - 1));
+                size_t diff = next_ptr - current_ptr;
+                if (diff > required_extra_bytes_to_record) {
+                    required_extra_bytes_to_record = 0;
                 }
                 else {
-                    ++reading_iterator;
+                    required_extra_bytes_to_record -= diff;
                 }
+                reading_iterator += diff;
+            }
+            else {
+                ++reading_iterator;
+            }
 
-                if (required_extra_bytes_to_record == 0 && start_ptr + reading_iterator >= pass_begin_swath_index->first_byte_in_child + pass_begin_swath_index->number_of_bytes && pass_begin_swath_index != reading_swath_index) {
-                    /* if there is no more bytes to record and this swath is done, go to next swath */
-                    pass_begin_swath_index = local_address_beyond_last_element(pass_begin_swath_index);
-                    reading_iterator = pass_begin_swath_index->first_byte_in_child - start_ptr;
-                }
+            if (required_extra_bytes_to_record == 0 && start_ptr + reading_iterator >= current_begin_swath_index->first_byte_in_child + current_begin_swath_index->number_of_bytes) {
+                /* if there is no more bytes to record and this swath is done, go to next swath */
+                current_begin_swath_index = local_address_beyond_last_element(current_begin_swath_index);
+                reading_iterator = current_begin_swath_index->first_byte_in_child - start_ptr;
             }
         }
 
-        /* check if we are interrupted */
-        bool stop_flag = atomic_load(&thread_args->shared->vars->stop_flag);
-        if (stop_flag) {
-            break;
-        }
-    }
-
-    assert(number_of_bytes_scanned == bytes_to_scan);
-
-    /* calculate and display progress, TODO: do this interactively. */
-    if (thread_args->thread_id == 0) 
-    {
-        for (size_t i = 0; i < NUM_DOTS; ++i) {
-            print_a_dot();
+        if (current_end_global_offset >= end_scan_offset) {
+            /* store extra bytes at end of scan */
+            for (size_t i = 0; i < required_extra_bytes_to_record; ++i) {
+                size_t data_offset = i + reading_iterator;
+                if (data_offset > bytes_read) {
+                    break;
+                }
+                const mem64_t* memory_ptr = (mem64_t*)(data + data_offset);
+                thread_args->writing_swath_index = add_element(&thread_args->output_matches, thread_args->writing_swath_index, (void*)start_ptr + data_offset,
+                                                get_u8b(memory_ptr), flags_empty);
+            }
         }
 
-        /* for front-end, update percentage */
-        thread_args->shared->vars->scan_progress = 1.f;
+        /* iterate */
+        current_begin_global_offset = current_end_global_offset;
+        current_begin_swath_index = current_last_swath_index;
+        current_begin_swath_local_offset = current_end_swath_local_offset;
     }
 
     free(data);

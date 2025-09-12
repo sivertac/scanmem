@@ -288,7 +288,7 @@ matches_and_old_values_swath* concat_array(matches_and_old_values_array **dest_a
 
         /* copy rest of source swaths */
         if (source_size > 0) {
-            /* next_dest_swath has to be set again due to allocate_enough_to_reach possibly mocing dest_array */
+            /* next_dest_swath has to be set again due to allocate_enough_to_reach possibly moving dest_array */
             next_dest_swath = (matches_and_old_values_swath*)local_address_beyond_last_element(dest_swath);
             memcpy((void*)next_dest_swath, next_source_swath, source_size);
             dest_swath = (matches_and_old_values_swath*)((size_t)next_dest_swath + last_swath_offset);
